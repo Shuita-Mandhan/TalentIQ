@@ -6,19 +6,28 @@ import { updatePassword, type ResetPasswordState } from "./actions";
 const inputClass =
   "h-11 w-full rounded border border-border bg-surface px-3.5 text-sm transition-colors hover:border-foreground/30 focus:border-accent";
 
-export function ResetPasswordForm() {
+/**
+ * With `invitationId` this is account setup: one password, and joining is part of the same submit.
+ * The action re-validates the id and the database re-checks that the invitation is still pending
+ * and still addressed to this account before anything is granted.
+ */
+export function ResetPasswordForm({ invitationId }: { invitationId?: string | null }) {
   const [state, formAction, isPending] = useActionState<ResetPasswordState, FormData>(
     updatePassword,
     {},
   );
   const [showPasswords, setShowPasswords] = useState(false);
   const type = showPasswords ? "text" : "password";
+  const label = invitationId ? "Set password & join workspace" : "Update password";
+  const pendingLabel = invitationId ? "Joining…" : "Updating…";
 
   return (
     <form action={formAction} className="space-y-5">
+      {invitationId && <input type="hidden" name="invitationId" value={invitationId} />}
+
       <div>
         <label htmlFor="password" className="mb-1.5 block text-sm font-medium">
-          New password
+          {invitationId ? "Password" : "New password"}
         </label>
         <input
           id="password"
@@ -33,7 +42,7 @@ export function ResetPasswordForm() {
 
       <div>
         <label htmlFor="confirmPassword" className="mb-1.5 block text-sm font-medium">
-          Confirm new password
+          {invitationId ? "Confirm password" : "Confirm new password"}
         </label>
         <input
           id="confirmPassword"
@@ -67,7 +76,7 @@ export function ResetPasswordForm() {
         disabled={isPending}
         className="h-11 w-full rounded bg-accent text-sm font-medium text-white transition-colors hover:bg-accent/90 disabled:cursor-progress disabled:opacity-70"
       >
-        {isPending ? "Updating…" : "Update password"}
+        {isPending ? pendingLabel : label}
       </button>
     </form>
   );

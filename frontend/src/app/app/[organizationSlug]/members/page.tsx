@@ -9,7 +9,7 @@ import { WorkspaceHeader } from "@/components/layout/workspace-header";
 import { ActionForm } from "@/components/ui/action-form";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { formatDate } from "@/lib/format";
-import { revokeInvitation } from "./actions";
+import { resendInvitation, revokeInvitation } from "./actions";
 import { AddMemberForm } from "./add-member-form";
 
 export const metadata: Metadata = { title: "Members" };
@@ -113,12 +113,21 @@ export default async function MembersPage({
                   <div className="flex items-center gap-5">
                     <span className="text-sm text-muted-foreground">Pending</span>
                     {canManage && (
-                      <ActionForm
-                        action={revokeInvitation}
-                        fields={{ organizationSlug, invitationId: invitation.id }}
-                        label="Revoke"
-                        ariaLabel={`Revoke the invitation for ${invitation.email}`}
-                      />
+                      <div className="flex items-start gap-2">
+                        <ActionForm
+                          action={resendInvitation}
+                          fields={{ organizationSlug, invitationId: invitation.id }}
+                          label="Resend"
+                          ariaLabel={`Resend the invitation to ${invitation.email}`}
+                          successLabel="Invitation sent."
+                        />
+                        <ActionForm
+                          action={revokeInvitation}
+                          fields={{ organizationSlug, invitationId: invitation.id }}
+                          label="Revoke"
+                          ariaLabel={`Revoke the invitation for ${invitation.email}`}
+                        />
+                      </div>
                     )}
                   </div>
                 </li>

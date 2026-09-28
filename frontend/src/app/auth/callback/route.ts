@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
+// The PKCE callback. Recovery emails now verify server-side through /auth/confirm, which works in
+// any browser rather than only the one that asked for the link, so this route serves nothing but
+// emails that were already in flight when that template changed. It can go once none remain.
+
 export async function GET(request: Request) {
   const { searchParams, origin } = new URL(request.url);
   const code = searchParams.get("code");

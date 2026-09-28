@@ -21,3 +21,11 @@ export async function getMyInvitation(invitationId: string): Promise<MyInvitatio
   if (error) throw new Error("Unable to load the invitation");
   return data as MyInvitation | null;
 }
+
+/** The caller's own pending invitations, for the recovery path on /app. */
+export async function getMyPendingInvitations(): Promise<MyInvitation[]> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("get_my_pending_organization_invitations");
+  if (error) throw new Error("Unable to load pending invitations");
+  return data as MyInvitation[];
+}

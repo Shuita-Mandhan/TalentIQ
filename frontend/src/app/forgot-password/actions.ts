@@ -1,7 +1,6 @@
 "use server";
 
-import { headers } from "next/headers";
-import { createClient } from "@/lib/supabase/server";
+import { createMailerClient } from "@/lib/supabase/mailer";
 import { EMAIL_PATTERN } from "@/lib/validation";
 
 export type ForgotPasswordState = { error?: string; sent?: boolean };
@@ -18,16 +17,20 @@ export async function requestPasswordReset(
     return { error: "Enter a valid email address." };
   }
 
-  // Origin is browser-set and validated against Host by Next.js; APP_URL is trusted deployment
-  // configuration for clients that strip it. Nothing else may supply the callback base URL.
-  const origin = (await headers()).get("origin") ?? process.env.APP_URL?.replace(/\/$/, "");
-  if (!origin) {
+  // Trusted deployment configuration is the only source of the destination in an authentication
+  // email - never the Origin or Host of the request. /auth/confirm re-validates it against the
+  // same APP_URL before honouring it.
+  const appUrl = process.env.APP_URL?.replace(/\/$/, "");
+  if (!appUrl) {
     return { error: GENERIC_FAILURE };
   }
 
-  const supabase = await createClient();
-  const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: `${origin}/auth/callback?next=/reset-password`,
+  // Session-less on purpose. A recovery link has no business depending on state in the browser
+  // that asked for it: the email is routinely opened on another device, in another browser, or
+  // after that browser's storage is long gone. It verifies server-side through /auth/confirm, and
+  // sending it from a client that writes no cookies is what keeps it that way.
+  const { error } = await createMailerClient().auth.resetPasswordForEmail(email, {
+    redirectTo: `${appUrl}/reset-password`,
   });
   if (error) {
     return { error: GENERIC_FAILURE };

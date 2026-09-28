@@ -6,6 +6,9 @@ const MESSAGES: Record<string, string> = {
   TQ001: "This role is managed by TalentIQ and cannot be changed.",
   TQ002: "Remove this role from its members before deleting it.",
   TQ003: "You cannot deactivate your own membership.",
+  TQ004:
+    "This change would leave the organization without anyone who can manage both members and roles.",
+  TQ005: "You cannot grant organization permissions that you do not have yourself.",
 };
 
 export const GENERIC_FAILURE = "Unable to save the change. Please try again.";

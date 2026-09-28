@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getUserContext } from "@/lib/auth/organization-context";
+import { getMyPendingInvitations } from "@/lib/organization/invitation";
 import { Brand } from "@/components/layout/brand";
 import { SignOutButton } from "@/components/layout/sign-out-button";
 import { StatusDot } from "@/components/ui/status-dot";
@@ -12,6 +13,10 @@ export default async function AppPage() {
   const user = await getUserContext();
   if (!user) redirect("/login");
   if (user.organizations.length === 1) redirect(`/app/${user.organizations[0].slug}`);
+
+  // Recovery for someone who confirmed their invitation email but never finished setting up: they
+  // are not a member yet, so their own pending invitations are how they get back into the flow.
+  const invitations = user.organizations.length === 0 ? await getMyPendingInvitations() : [];
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 sm:px-10">
@@ -41,16 +46,48 @@ export default async function AppPage() {
               style={{ animationDelay: "80ms" }}
               className="mt-4 animate-rise text-3xl font-semibold tracking-tight motion-reduce:animate-none sm:text-4xl"
             >
-              No organization access
+              {invitations.length > 0 ? "Finish your setup" : "No organization access"}
             </h1>
             <p
               style={{ animationDelay: "160ms" }}
               className="mt-4 max-w-md animate-rise text-pretty text-muted-foreground motion-reduce:animate-none"
             >
-              Your account is not a member of any active organization yet. Ask an organization
-              administrator to add you.
+              {invitations.length > 0
+                ? "You have an invitation waiting. Finish setting up to join the workspace."
+                : "Your account is not a member of any active organization yet. Ask an organization administrator to add you."}
               {user.isPlatformAdmin && " As a platform administrator you can still open Platform."}
             </p>
+
+            {invitations.length > 0 && (
+              <section
+                style={{ animationDelay: "240ms" }}
+                className="mt-10 max-w-lg animate-rise motion-reduce:animate-none"
+              >
+                <h2 className="font-mono text-xs tracking-wide text-muted-foreground uppercase">
+                  Pending invitations
+                </h2>
+                <ul className="mt-3 divide-y divide-border border-y border-border">
+                  {invitations.map((invitation) => (
+                    <li key={invitation.id}>
+                      <Link
+                        href={`/invite/${invitation.id}`}
+                        className="group flex items-center justify-between gap-6 py-4 transition-colors hover:text-accent"
+                      >
+                        <span className="font-medium tracking-tight">
+                          {invitation.organization_name}
+                        </span>
+                        <span className="flex items-center gap-3 text-sm text-muted-foreground">
+                          Continue setup
+                          <span aria-hidden className="transition-transform group-hover:translate-x-0.5">
+                            →
+                          </span>
+                        </span>
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
           </>
         ) : (
           <>
