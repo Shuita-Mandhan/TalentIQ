@@ -20,6 +20,38 @@ export type PlatformService = {
 
 export type ServiceEntitlement = { service_key: string; enabled: boolean };
 
+/** One row per organization: its lifecycle state and how it is administered. */
+export type PlatformOrganizationOverview = {
+  organization_id: string;
+  name: string;
+  slug: string;
+  is_active: boolean;
+  created_at: string;
+  has_recovery_manager: boolean;
+  administrator_count: number;
+  pending_admin_email: string | null;
+  pending_admin_invitation_id: string | null;
+  pending_admin_since: string | null;
+  pending_member_invitations: number;
+  caller_is_member: boolean;
+};
+
+/**
+ * The whole control plane in one read. Returns null rather than throwing when the overview
+ * function is unreachable: the operations dashboard is more useful degraded, saying plainly that
+ * administration state could not be loaded, than replaced by an error page that also takes down
+ * everything else on it.
+ */
+export async function getPlatformOverview(): Promise<PlatformOrganizationOverview[] | null> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("get_platform_organizations_overview");
+  if (error) {
+    console.error("get_platform_organizations_overview failed:", error);
+    return null;
+  }
+  return data as PlatformOrganizationOverview[];
+}
+
 const ORGANIZATION_COLUMNS = "id, name, slug, is_active, created_at";
 
 export async function getPlatformOrganizations(limit?: number): Promise<PlatformOrganization[]> {

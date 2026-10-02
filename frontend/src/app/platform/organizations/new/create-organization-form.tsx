@@ -4,7 +4,7 @@ import { useActionState, useState } from "react";
 import { createOrganization, type CreateOrganizationState } from "../actions";
 
 const inputClass =
-  "h-11 w-full rounded border border-border bg-surface px-3.5 text-sm transition-colors hover:border-foreground/30 focus:border-accent";
+  "h-11 w-full rounded-md border border-border bg-surface px-3.5 text-sm transition-colors duration-150 hover:border-border-strong focus:border-accent";
 
 function suggestSlug(name: string): string {
   return name
@@ -70,6 +70,28 @@ export function CreateOrganizationForm() {
         </p>
       </div>
 
+      <div className="border-t border-border pt-5">
+        <label htmlFor="adminEmail" className="mb-1.5 block text-sm font-medium">
+          Initial administrator
+        </label>
+        <input
+          id="adminEmail"
+          name="adminEmail"
+          type="email"
+          required
+          autoComplete="off"
+          spellCheck={false}
+          defaultValue={state.adminEmail ?? ""}
+          aria-describedby="admin-help"
+          className={`${inputClass} font-mono`}
+        />
+        <p id="admin-help" className="mt-1.5 text-xs text-pretty text-muted-foreground">
+          Choose the person who will administer this organization&apos;s members, roles and
+          settings. An existing TalentIQ account is set up immediately; a new address receives an
+          invitation. Use your own email only if you intend to administer this tenant.
+        </p>
+      </div>
+
       {state.error && (
         <p role="alert" className="text-sm text-destructive">
           {state.error}
@@ -79,7 +101,7 @@ export function CreateOrganizationForm() {
       <button
         type="submit"
         disabled={isPending}
-        className="h-11 rounded bg-accent px-5 text-sm font-medium text-white transition-colors hover:bg-accent/90 disabled:cursor-progress disabled:opacity-70"
+        className="inline-flex h-11 items-center rounded-md bg-accent px-5 text-sm font-medium text-white shadow-sm transition-colors duration-150 hover:bg-accent-strong disabled:cursor-progress disabled:opacity-70"
       >
         {isPending ? "Creating…" : "Create organization"}
       </button>

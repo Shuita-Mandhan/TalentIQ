@@ -1,6 +1,7 @@
 "use server";
 
 import { redirect } from "next/navigation";
+import { BOOTSTRAP_SETUP_INACTIVE } from "@/lib/organization/access-errors";
 import { getMyInvitation } from "@/lib/organization/invitation";
 import { createClient } from "@/lib/supabase/server";
 
@@ -46,6 +47,10 @@ export async function finishAccount(
     .rpc("accept_organization_invitation", { target_invitation_id: invitationId })
     .single();
   if (accepted.error) {
+    // A platform-issued administrator setup whose organization has since gained an administrator
+    // of its own is not retryable, so it does not pretend to be.
+    const code = (accepted.error as { code?: string }).code;
+    if (code === "TQ007") return { error: BOOTSTRAP_SETUP_INACTIVE };
     return { error: "Your password was saved, but joining the workspace failed. Please try again." };
   }
 

@@ -1,11 +1,10 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { notFound } from "next/navigation";
 import { hasPermission } from "@/lib/auth/authorization";
 import { requireOrganizationAccess } from "@/lib/auth/organization-context";
 import { PERMISSIONS } from "@/lib/auth/permissions";
 import { getOrganizationMember, getOrganizationRoles } from "@/lib/organization/access-data";
-import { WorkspaceHeader } from "@/components/layout/workspace-header";
+import { PageHeading } from "@/components/layout/page-heading";
 import { ActionForm } from "@/components/ui/action-form";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { setMemberStatus } from "../actions";
@@ -33,83 +32,73 @@ export default async function MemberPage({
   const isSelf = member.user_id === user.userId;
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-6 sm:px-10">
-      <WorkspaceHeader user={user} />
-
-      <main className="flex-1 py-6">
-        <Link
-          href={`/app/${organizationSlug}/members`}
-          className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
-        >
-          ← Members
-        </Link>
-
-        <div className="mt-4 flex flex-wrap items-start justify-between gap-6">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">{member.full_name ?? member.email}</h1>
-            <dl className="mt-4 flex flex-wrap gap-x-8 gap-y-2 text-sm">
-              <div className="flex gap-2">
-                <dt className="text-muted-foreground">Email</dt>
-                <dd className="font-mono">{member.email}</dd>
-              </div>
-              <div className="flex gap-2">
-                <dt className="text-muted-foreground">Status</dt>
-                <dd>
-                  <StatusBadge active={member.is_active} labels={["Active", "Inactive"]} />
-                </dd>
-              </div>
-            </dl>
-          </div>
-
-          {canManage &&
-            (isSelf ? (
-              <p className="max-w-xs text-sm text-muted-foreground">
-                This is your own membership; another member with manage access can change its status.
-              </p>
-            ) : (
-              <ActionForm
-                action={setMemberStatus}
-                fields={{
-                  organizationSlug,
-                  membershipId: member.membership_id,
-                  active: member.is_active ? "false" : "true",
-                }}
-                label={member.is_active ? "Deactivate membership" : "Reactivate membership"}
-              />
-            ))}
-        </div>
-
-        {!member.is_active && (
-          <p className="mt-6 max-w-xl border-l-2 border-border pl-3 text-sm text-muted-foreground">
-            Inactive: this person cannot open the workspace. Their role assignments are kept and apply
-            again on reactivation.
-          </p>
-        )}
-
-        <section className="mt-12">
-          <h2 className="text-lg font-semibold tracking-tight">Roles</h2>
-          {canManage && roles.length > 0 ? (
-            <div className="mt-4 max-w-xl">
-              <MemberRolesForm
-                organizationSlug={organizationSlug}
-                membershipId={member.membership_id}
-                roles={roles}
-                assignedRoleIds={member.role_ids}
-              />
-            </div>
-          ) : member.role_names.length === 0 ? (
-            <p className="mt-3 text-sm text-muted-foreground">No roles assigned.</p>
+    <>
+      <PageHeading
+        back={{ href: `/app/${organizationSlug}/members`, label: "Members" }}
+        title={member.full_name ?? member.email}
+        actions={
+          canManage &&
+          (isSelf ? (
+            <p className="max-w-xs text-sm text-muted-foreground">
+              This is your own membership; another member with manage access can change its status.
+            </p>
           ) : (
-            <ul className="mt-3 flex flex-wrap gap-2">
-              {member.role_names.map((name) => (
-                <li key={name} className="rounded border border-border bg-surface px-2.5 py-1 text-sm">
-                  {name}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      </main>
-    </div>
+            <ActionForm
+              action={setMemberStatus}
+              fields={{
+                organizationSlug,
+                membershipId: member.membership_id,
+                active: member.is_active ? "false" : "true",
+              }}
+              label={member.is_active ? "Deactivate membership" : "Reactivate membership"}
+            />
+          ))
+        }
+      />
+
+      <dl className="mt-6 flex flex-wrap gap-x-8 gap-y-2 text-sm">
+        <div className="flex gap-2">
+          <dt className="text-muted-foreground">Email</dt>
+          <dd className="font-mono break-all">{member.email}</dd>
+        </div>
+        <div className="flex gap-2">
+          <dt className="text-muted-foreground">Status</dt>
+          <dd>
+            <StatusBadge active={member.is_active} labels={["Active", "Inactive"]} />
+          </dd>
+        </div>
+      </dl>
+
+      {!member.is_active && (
+        <p className="mt-6 max-w-xl border-l-2 border-border pl-3 text-sm text-muted-foreground">
+          Inactive: this person cannot open the workspace. Their role assignments are kept and apply
+          again on reactivation.
+        </p>
+      )}
+
+      <section className="mt-12">
+        <h2 className="text-lg font-semibold tracking-tight">Roles</h2>
+        {canManage && roles.length > 0 ? (
+          <div className="mt-4 max-w-xl">
+            <MemberRolesForm
+              organizationSlug={organizationSlug}
+              membershipId={member.membership_id}
+              roles={roles}
+              assignedRoleIds={member.role_ids}
+            />
+          </div>
+        ) : member.role_names.length === 0 ? (
+          <p className="mt-3 text-sm text-muted-foreground">No roles assigned.</p>
+        ) : (
+          <ul className="mt-3 flex flex-wrap gap-2">
+            {member.role_names.map((name) => (
+              <li key={name} className="rounded border border-border bg-surface px-2.5 py-1 text-sm">
+                {name}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </>
   );
 }

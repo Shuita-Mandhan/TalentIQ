@@ -14,6 +14,9 @@ import {
 
 const ID = "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed";
 const PASSWORD = "a-good-enough-password";
+// Whatever acceptance refused with travels back to the recipient verbatim, so the action can say
+// "try again" or "this setup has lapsed" without the orchestrator knowing the difference.
+const ACCEPT_REFUSED = "Joining the workspace failed.";
 
 type Recorded = { calls: string[]; steps: AccountSetupSteps };
 
@@ -50,7 +53,7 @@ function steps(
       acceptInvitation: async (id) => {
         assert.equal(id, ID);
         calls.push("accept");
-        return acceptedSlug;
+        return acceptedSlug === null ? { error: ACCEPT_REFUSED } : { organizationSlug: acceptedSlug };
       },
     },
   };
@@ -87,7 +90,7 @@ test("a failed acceptance leaves the password set and the invitation retryable",
   const { calls, steps: s } = steps({ acceptedSlug: null });
   const outcome = await completeInvitedAccountSetup(s, ID, PASSWORD);
 
-  assert.deepEqual(outcome, { status: "not-joined" });
+  assert.deepEqual(outcome, { status: "not-joined", reason: ACCEPT_REFUSED });
   // Nothing after the password change may undo it: the only steps that ran are the ones above.
   assert.deepEqual(calls, ["load", "password", "revoke-others", "accept"]);
   assert.ok(calls.indexOf("password") < calls.indexOf("accept"), "the password is set first");

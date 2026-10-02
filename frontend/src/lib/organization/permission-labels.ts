@@ -26,4 +26,12 @@ export const PERMISSION_LABELS: Record<PermissionKey, { label: string; descripti
     label: "Manage roles",
     description: "Create, edit and delete custom roles and their permissions.",
   },
+  [PERMISSIONS.JOBS_VIEW]: {
+    label: "View jobs",
+    description: "See jobs and the requirements defined for them.",
+  },
+  [PERMISSIONS.JOBS_MANAGE]: {
+    label: "Manage jobs",
+    description: "Create and edit jobs, change their status, and edit their requirements.",
+  },
 };

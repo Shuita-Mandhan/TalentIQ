@@ -8,6 +8,8 @@ export const PERMISSIONS = {
   MEMBERS_MANAGE: "members.manage",
   ROLES_VIEW: "roles.view",
   ROLES_MANAGE: "roles.manage",
+  JOBS_VIEW: "jobs.view",
+  JOBS_MANAGE: "jobs.manage",
 } as const;
 
 export type PermissionKey = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];

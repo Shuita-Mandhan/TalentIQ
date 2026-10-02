@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { invitationContinuation } from "@/lib/auth/invite-redirect";
 import { completeInvitedAccountSetup } from "@/lib/organization/account-setup";
+import { BOOTSTRAP_SETUP_INACTIVE } from "@/lib/organization/access-errors";
 import { getMyInvitation } from "@/lib/organization/invitation";
 import { createClient } from "@/lib/supabase/server";
 
@@ -10,6 +11,7 @@ export type ResetPasswordState = { error?: string };
 
 const PASSWORD_REJECTED =
   "Unable to update the password. Choose a different password and try again.";
+const JOIN_FAILED = "Your password was saved, but joining the workspace failed. Please try again.";
 
 export async function updatePassword(
   _previous: ResetPasswordState,
@@ -50,8 +52,17 @@ export async function updatePassword(
           const accepted = await supabase
             .rpc("accept_organization_invitation", { target_invitation_id: id })
             .single();
-          if (accepted.error) return null;
-          return (accepted.data as { organization_slug: string }).organization_slug;
+          if (accepted.error) {
+            // A lapsed administrator setup is not a retry: say so plainly rather than inviting
+            // them to submit the same thing again.
+            const code = (accepted.error as { code?: string }).code;
+            return {
+              error: code === "TQ007" ? BOOTSTRAP_SETUP_INACTIVE : JOIN_FAILED,
+            };
+          }
+          return {
+            organizationSlug: (accepted.data as { organization_slug: string }).organization_slug,
+          };
         },
       },
       invitationId,
@@ -64,10 +75,8 @@ export async function updatePassword(
       };
     }
     if (outcome.status === "password-rejected") return { error: PASSWORD_REJECTED };
-    // The account already works, and acceptance is idempotent, so submitting again is the retry.
-    if (outcome.status === "not-joined") {
-      return { error: "Your password was saved, but joining the workspace failed. Please try again." };
-    }
+    // The account already works either way; the reason says whether submitting again would help.
+    if (outcome.status === "not-joined") return { error: outcome.reason };
     redirect(`/app/${outcome.organizationSlug}`);
   }
 

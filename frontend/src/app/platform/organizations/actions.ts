@@ -4,11 +4,22 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import type { ActionState } from "@/components/ui/action-form";
 import { requirePlatformActionAccess } from "@/lib/platform/auth";
+import {
+  bootstrapAdministrator,
+  cancelAdministratorSetup as cancelSetup,
+  getAdministrationState,
+} from "@/lib/platform/bootstrap";
 import { createClient } from "@/lib/supabase/server";
+import { EMAIL_PATTERN } from "@/lib/validation";
 
 // Every action authorizes itself: the rendering page having passed the platform check is irrelevant.
 
-export type CreateOrganizationState = { error?: string; name?: string; slug?: string };
+export type CreateOrganizationState = {
+  error?: string;
+  name?: string;
+  slug?: string;
+  adminEmail?: string;
+};
 
 // Mirrors the database constraints so invalid input is rejected before a round-trip.
 const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -28,14 +39,25 @@ export async function createOrganization(
 
   const name = text(formData, "name");
   const slug = text(formData, "slug").toLowerCase();
+  const adminEmail = text(formData, "adminEmail").toLowerCase();
   if (name.length === 0 || name.length > 120) {
-    return { error: "Enter an organization name (up to 120 characters).", name, slug };
+    return { error: "Enter an organization name (up to 120 characters).", name, slug, adminEmail };
   }
   if (!SLUG_PATTERN.test(slug)) {
     return {
       error: "Slug must be 1–63 lowercase letters, digits or hyphens, and cannot start or end with a hyphen.",
       name,
       slug,
+      adminEmail,
+    };
+  }
+  // Required: an organization nobody can enter is not a finished organization.
+  if (!EMAIL_PATTERN.test(adminEmail)) {
+    return {
+      error: "Enter the email address of the person who will administer this organization.",
+      name,
+      slug,
+      adminEmail,
     };
   }
 
@@ -53,12 +75,108 @@ export async function createOrganization(
           : "Unable to create the organization. Please try again.",
       name,
       slug,
+      adminEmail,
     };
   }
 
+  // Creating the organization and delivering an email are not one transaction and are not pretended
+  // to be. The organization is kept whatever happens next, and the detail page derives the setup
+  // state from the database rather than from this outcome, so a failed send shows as work still to
+  // do with a retry beside it instead of a success that was not one.
+  const outcome = await bootstrapAdministrator(data.id, name, adminEmail);
+
   revalidatePath("/platform");
   revalidatePath("/platform/organizations");
-  redirect(`/platform/organizations/${data.id}`);
+  redirect(
+    outcome.state === "seated" || outcome.state === "invited"
+      ? `/platform/organizations/${data.id}`
+      : `/platform/organizations/${data.id}?setup=incomplete`,
+  );
+}
+
+/** Names the administrator of an organization that still cannot administer itself. */
+export async function setupAdministrator(
+  _previous: CreateOrganizationState,
+  formData: FormData,
+): Promise<CreateOrganizationState> {
+  await requirePlatformActionAccess();
+
+  const organizationId = text(formData, "organizationId");
+  const adminEmail = text(formData, "adminEmail").toLowerCase();
+  if (!UUID_PATTERN.test(organizationId)) return { error: "Invalid request." };
+  if (!EMAIL_PATTERN.test(adminEmail)) {
+    return { error: "Enter a valid email address.", adminEmail };
+  }
+  return runBootstrap(organizationId, adminEmail);
+}
+
+/**
+ * Sends the pending setup again. The address is read from the database rather than the form: this
+ * button resends what is outstanding, and is never a way to move the setup to someone else.
+ */
+export async function resendAdministratorSetup(
+  _previous: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  await requirePlatformActionAccess();
+
+  const organizationId = text(formData, "organizationId");
+  if (!UUID_PATTERN.test(organizationId)) return { error: "Invalid request." };
+
+  // Read from the database, not the form, so this button can only ever resend what is outstanding.
+  const administration = await getAdministrationState(organizationId);
+  if (!administration?.pending_admin_email) {
+    return { error: "There is no administrator setup pending for this organization." };
+  }
+
+  const result = await runBootstrap(organizationId, administration.pending_admin_email);
+  if (result.error) return { error: result.error };
+  return { done: true, message: "Setup email sent again." };
+}
+
+/** Cancels the pending setup so a different administrator can be named. */
+export async function cancelAdministratorSetup(
+  _previous: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  await requirePlatformActionAccess();
+
+  const organizationId = text(formData, "organizationId");
+  const invitationId = text(formData, "invitationId");
+  if (!UUID_PATTERN.test(organizationId) || !UUID_PATTERN.test(invitationId)) {
+    return { error: "Invalid request." };
+  }
+
+  const { error } = await cancelSetup(organizationId, invitationId);
+  if (error) return { error };
+
+  revalidatePath("/platform/organizations");
+  revalidatePath(`/platform/organizations/${organizationId}`);
+  return {};
+}
+
+/** Shared tail of the two paths that seat or invite an administrator. */
+async function runBootstrap(
+  organizationId: string,
+  adminEmail: string,
+): Promise<CreateOrganizationState> {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("organizations")
+    .select("name")
+    .eq("id", organizationId)
+    .maybeSingle();
+  if (error) return { error: GENERIC_FAILURE, adminEmail };
+  if (!data) return { error: "Organization not found.", adminEmail };
+
+  const outcome = await bootstrapAdministrator(organizationId, data.name, adminEmail);
+  if (outcome.state === "failed" || outcome.state === "invite-not-sent") {
+    return { error: outcome.error, adminEmail };
+  }
+
+  revalidatePath("/platform/organizations");
+  revalidatePath(`/platform/organizations/${organizationId}`);
+  return {};
 }
 
 const GENERIC_FAILURE = "Unable to save the change. Please try again.";

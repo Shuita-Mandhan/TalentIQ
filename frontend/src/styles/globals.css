@@ -1,13 +1,38 @@
 @import "tailwindcss";
 
+/*
+ * Two planes, deliberately different materials.
+ *
+ * The workspace rail is a deep green-black: near-black but never pure, so it reads as a substantial
+ * navigation plane rather than a panel. The working canvas is a warm neutral, not flat white, so
+ * white surfaces sit ON it with real elevation instead of dissolving into it. Depth comes from
+ * solid colour, hairlines and restrained shadow - no glass, no decorative gradients.
+ */
 :root {
-  --background: #fafaf9;
-  --foreground: #1c1917;
-  --muted-foreground: #78716c;
+  --background: #f6f5f2;
+  --foreground: #16211e;
+  --muted-foreground: #6b7671;
   --surface: #ffffff;
-  --border: #e7e5e4;
+  --surface-sunken: #efeeea;
+  --border: #e3e1db;
+  --border-strong: #d2cfc7;
   --accent: #0f6e63;
+  --accent-strong: #0b564d;
+  --accent-soft: #e4efec;
   --destructive: #b42318;
+
+  /* Navigation plane */
+  --rail: #0d1412;
+  --rail-raised: #18211e;
+  --rail-border: #222c28;
+  --rail-foreground: #e9edeb;
+  --rail-muted: #8b978f;
+
+  --shadow-sm: 0 1px 2px rgb(22 33 30 / 0.05), 0 1px 3px rgb(22 33 30 / 0.04);
+  --shadow-md: 0 2px 4px rgb(22 33 30 / 0.04), 0 8px 20px -6px rgb(22 33 30 / 0.1);
+
+  /* Interaction stays inside 120-220ms; nothing here is meant to be watched. */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @theme inline {
@@ -15,20 +40,34 @@
   --color-foreground: var(--foreground);
   --color-muted-foreground: var(--muted-foreground);
   --color-surface: var(--surface);
+  --color-surface-sunken: var(--surface-sunken);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
   --color-destructive: var(--destructive);
+  --color-rail: var(--rail);
+  --color-rail-raised: var(--rail-raised);
+  --color-rail-border: var(--rail-border);
+  --color-rail-foreground: var(--rail-foreground);
+  --color-rail-muted: var(--rail-muted);
+
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 
-  --animate-rise: rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-rise: rise 0.5s var(--ease-out) both;
   --animate-sweep: sweep 3.6s ease-in-out infinite;
   --animate-pulse-ring: pulse-ring 2.4s ease-out infinite;
+  --animate-drift: drift 14s ease-in-out infinite alternate;
 
   @keyframes rise {
     from {
       opacity: 0;
-      transform: translateY(10px);
+      transform: translateY(8px);
     }
     to {
       opacity: 1;
@@ -55,6 +94,16 @@
       opacity: 0;
     }
   }
+
+  /* Idle motion for the access core. Slow and small enough to register as depth, not animation. */
+  @keyframes drift {
+    from {
+      transform: translate3d(0, 0, 0);
+    }
+    to {
+      transform: translate3d(0, -10px, 12px);
+    }
+  }
 }
 
 @layer base {
@@ -73,5 +122,36 @@
   :focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+
+  /* Focus has to remain visible against the dark navigation plane too. */
+  .on-rail :focus-visible {
+    outline-color: #5fd3c2;
+  }
+}
+
+@layer utilities {
+  /* One opt-in for the pointer-tilt scene, so the 3D context is declared where it is used. */
+  .scene {
+    perspective: 1100px;
+    perspective-origin: 50% 45%;
+  }
+
+  .preserve-3d {
+    transform-style: preserve-3d;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * The access core is built from transforms driven by custom properties. Reduced motion freezes
+   * the scene flat and readable rather than merely shortening the animation.
+   */
+  .scene,
+  .scene * {
+    --tilt-x: 0deg !important;
+    --tilt-y: 0deg !important;
+    animation: none !important;
+    transition: none !important;
   }
 }

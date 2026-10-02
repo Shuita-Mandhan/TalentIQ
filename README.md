@@ -75,6 +75,45 @@ Schema changes live in `supabase/migrations` and are applied to the hosted Supab
 
 The frontend reads `frontend/.env.local`; copy `frontend/.env.example` and fill in the Supabase URL and publishable key. `APP_URL` is the trusted server-side base URL (`http://localhost:3000` locally) and the only source of the destination in an authentication email; the request's `Origin` and `Host` are never used for one. `SUPABASE_SECRET_KEY` is server-only and is used solely by the Supabase Auth Admin client to send first-time member invitations; it must never be exposed to the browser or prefixed with `NEXT_PUBLIC_`. The backend needs none yet.
 
+## Resume processing
+
+Uploading a resume stores a document. Reading one turns it into a candidate profile, and the two are
+separate steps on purpose: nothing is read automatically, nothing is read while a page renders, and a
+page refresh cannot start a second attempt on a document already in flight.
+
+A recruiter with `jobs.manage` presses **Process** on a row in Resume intake, or **Read N resumes** to
+work through everything unread two at a time. The pipeline is:
+
+```text
+stored bytes -> document extractor (PDF or DOCX) -> normalized text -> AI provider -> strict parser -> database
+```
+
+Each attempt ends in one of five states. Attempts accumulate rather than overwrite one another, so a
+failure stays readable after the retry that followed it.
+
+| State | What it means |
+| --- | --- |
+| Waiting | Created, not started. |
+| Processing | In flight. A second attempt is refused while this one can still be alive. |
+| Ready for review | Text extracted, profile built, and the person identified by an exact email. |
+| Needs review | There is something to look at, but a person has to decide: no readable text, no email or phone to identify anyone, or contact details that disagree with an existing candidate. |
+| Failed | The document could not be read, or the provider did not answer. The original file is untouched. |
+
+**Retrying.** A failed or needs-review attempt shows **Retry** on the row and on the profile page. A
+successful one does not: nothing may overwrite a profile that was read correctly, and the database
+refuses it as well as the interface.
+
+**When a resume has no extractable text.** A scan or a photograph extracts to a few stray characters.
+That is reported as *Needs review* with the reason, and no model is asked to invent a profile from
+nothing. There is no OCR in this version; the document is kept and can be downloaded and re-made as a
+text PDF.
+
+**Evidence.** Every detail on a profile carries a quote, and the application searches the extracted
+text for that quote itself rather than trusting the model's claim about it. A quote that cannot be
+found is labelled unconfirmed, the page number shown is the page the application found the quote on,
+and anything the model produced that is not written in the document at all is dropped before it is
+stored.
+
 ## Hosted email templates
 
 Both authentication emails must use Supabase's `token_hash` pattern so that verification happens server-side in `/auth/confirm`. This is what lets a link work in a different browser from the one that asked for it, which an account-setup link sent by an administrator always is. The repository cannot enforce dashboard configuration, so set **Invite** and **Reset Password** to:
