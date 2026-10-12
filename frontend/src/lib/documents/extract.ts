@@ -14,8 +14,14 @@
 // reader is pdf.js by way of unpdf, used only for its text layer.
 
 import { inflateRawSync } from "node:zlib";
-import { extractText, getDocumentProxy } from "unpdf";
-import { MAX_PDF_PAGES, normalizeDocument, type DocumentText } from "./text.ts";
+import { getDocumentProxy } from "unpdf";
+import {
+  MAX_PDF_PAGES,
+  joinWrappedLines,
+  looksLikeHeading,
+  normalizeDocument,
+  type DocumentText,
+} from "./text.ts";
 
 export type DocumentParser = "pdf" | "docx";
 
@@ -95,7 +101,268 @@ async function withinTimeout(
 
 // ---------------------------------------------------------------------------------------------
 // PDF
+//
+// pdf.js hands back text runs in CONTENT-STREAM order, which is the order the producing tool wrote
+// them and is not necessarily the order a person reads them. Resume templates built in design tools
+// routinely write a sidebar's headings before its contents, or a whole column out of sequence, and
+// taking that order as the reading order detaches every heading from the text under it. One real
+// resume arrived with "SKILLS" and "LANGUAGE" adjacent on lines 3 and 4 and the actual skills six
+// lines further down under "EDUCATION" - at which point no model, however well prompted, can tell
+// which section a line belongs to, because that information is no longer in the text.
+//
+// So the order is reconstructed from the positions pdf.js also provides: columns first, then top to
+// bottom within each column. A document with no column gutter is simply sorted top to bottom, which
+// is what a single-column file already was.
+//
+// The same positions settle a second question. A list item too long for its column arrives as two
+// lines - "Packaged Consumer Goods" and "Sales" - and read as two lines it becomes two skills, one of
+// them a word of the other. The lines of one wrapped piece of text all end flush at the margin that
+// broke them, which is what isWrappedBlock looks for, and lines that merely sit under one another do
+// not.
 // ---------------------------------------------------------------------------------------------
+
+/** A positioned text run, as pdf.js reports it. PDF coordinates put y=0 at the bottom of the page. */
+type TextRun = {
+  x: number;
+  y: number;
+  width: number;
+  /** The run's point size, which is how a resume marks a heading. */
+  height: number;
+  /** pdf.js saw a line break after this run: whatever it reported next is the next line of it. */
+  eol: boolean;
+  /** Position in the order pdf.js reported, which is the order the producing tool wrote. */
+  order: number;
+  str: string;
+};
+
+/** One visual line, with what is needed to tell a wrapped line from a separately placed one. */
+type TextLine = {
+  text: string;
+  x: number;
+  right: number;
+  height: number;
+  firstOrder: number;
+  lastOrder: number;
+  lastEol: boolean;
+};
+
+/** Runs whose baselines are within this many points are on the same visual line. */
+const LINE_TOLERANCE_PT = 3;
+
+/** Narrower than this is letter-spacing or a wide margin, not a column gutter. */
+const MIN_GUTTER_PT = 24;
+
+/** A side holding less of the page than this is a stray label, not a column. */
+const MIN_COLUMN_SHARE = 0.15;
+
+/** Below this there is not enough on the page for "column" to mean anything. */
+const MIN_RUNS_FOR_COLUMNS = 10;
+
+/** Edges within this many points are the same edge, allowing for rounding in the page's numbers. */
+const SAME_EDGE_PT = 2;
+
+/** How much larger than the body text a line must be set before it counts as a heading. */
+const HEADING_SIZE_RATIO = 1.25;
+
+/** A line ending in one of these finished a sentence, so it did not run out of room. */
+const ENDS_SENTENCE = /[.?!:;]$/;
+
+function textRuns(items: readonly unknown[]): TextRun[] {
+  const runs: TextRun[] = [];
+  for (const item of items) {
+    const candidate = item as {
+      str?: unknown;
+      width?: unknown;
+      height?: unknown;
+      hasEOL?: unknown;
+      transform?: unknown;
+    };
+    if (typeof candidate.str !== "string" || candidate.str.trim() === "") continue;
+    const transform = candidate.transform;
+    if (!Array.isArray(transform) || transform.length < 6) continue;
+    runs.push({
+      x: Number(transform[4]),
+      y: Number(transform[5]),
+      width: typeof candidate.width === "number" ? candidate.width : 0,
+      height: typeof candidate.height === "number" ? candidate.height : 0,
+      eol: candidate.hasEOL === true,
+      order: runs.length,
+      str: candidate.str,
+    });
+  }
+  return runs;
+}
+
+/**
+ * The x of the widest vertical band no run crosses, or null when the page has no columns.
+ *
+ * Decided from runs rather than from assembled lines, and that ordering matters: a sidebar run and a
+ * main-column run often share a baseline, so grouping into lines first invents full-width lines that
+ * cross every candidate band and the gutter is never found.
+ *
+ * Deliberately conservative - it finds at most one gutter, requires a real gap, and requires both
+ * sides to carry a meaningful share of the page. Anything less clear-cut is treated as one column,
+ * because mis-splitting a single-column resume would be worse than not splitting a two-column one.
+ */
+function findGutter(runs: readonly TextRun[]): number | null {
+  if (runs.length < MIN_RUNS_FOR_COLUMNS) return null;
+
+  let bestEdge: number | null = null;
+  let bestGap = 0;
+  for (const edge of new Set(runs.map((run) => run.x + run.width))) {
+    if (runs.some((run) => run.x < edge && run.x + run.width > edge)) continue;
+    const left = runs.filter((run) => run.x + run.width <= edge);
+    const right = runs.filter((run) => run.x >= edge);
+    if (left.length === 0 || right.length === 0) continue;
+    if (Math.min(left.length, right.length) / runs.length < MIN_COLUMN_SHARE) continue;
+
+    const gap =
+      Math.min(...right.map((run) => run.x)) - Math.max(...left.map((run) => run.x + run.width));
+    if (gap >= MIN_GUTTER_PT && gap > bestGap) {
+      bestGap = gap;
+      bestEdge = edge;
+    }
+  }
+  return bestEdge;
+}
+
+/** Runs grouped into visual lines, top to bottom, each line left to right. */
+function linesOf(runs: readonly TextRun[]): TextLine[] {
+  const grouped: { y: number; runs: TextRun[] }[] = [];
+  for (const run of runs) {
+    const line = grouped.find((candidate) => Math.abs(candidate.y - run.y) <= LINE_TOLERANCE_PT);
+    if (line) line.runs.push(run);
+    else grouped.push({ y: run.y, runs: [run] });
+  }
+
+  return grouped
+    .sort((a, b) => b.y - a.y)
+    .map(({ runs: lineRuns }) => {
+      const across = [...lineRuns].sort((a, b) => a.x - b.x);
+      const written = [...lineRuns].sort((a, b) => a.order - b.order);
+      const last = written[written.length - 1] as TextRun;
+      return {
+        text: across.reduce((text, run, index) => {
+          if (index === 0) return run.str;
+          const previous = across[index - 1] as TextRun;
+          // Runs that touch are one word split by kerning; a real gap is a space. Joining everything
+          // with a space would spell a word out letter by letter, and joining everything without one
+          // would run "French" into the phone number beside it.
+          const apart = run.x - (previous.x + previous.width) > 1;
+          return apart ? `${text} ${run.str}` : text + run.str;
+        }, ""),
+        x: Math.min(...across.map((run) => run.x)),
+        right: Math.max(...across.map((run) => run.x + run.width)),
+        height: Math.max(...across.map((run) => run.height)),
+        firstOrder: (written[0] as TextRun).order,
+        lastOrder: last.order,
+        lastEol: last.eol,
+      };
+    });
+}
+
+/**
+ * A column's lines cut into the blocks of text the document drew them in.
+ *
+ * Two consecutive lines are one block when pdf.js says the first ends in a line break, the second is
+ * the very next run it reported, and both begin at the same left edge - which together say the
+ * producing tool emitted them as one piece of text. Anything else starts a new block, including the
+ * next line of a scrambled content stream, which is how a sidebar heading stays out of the block
+ * belonging to the item below it.
+ */
+function blocksOf(lines: readonly TextLine[]): TextLine[][] {
+  const blocks: TextLine[][] = [];
+  for (const line of lines) {
+    const open = blocks[blocks.length - 1];
+    const previous = open?.[open.length - 1];
+    const continues =
+      open !== undefined &&
+      previous !== undefined &&
+      previous.lastEol &&
+      line.firstOrder === previous.lastOrder + 1 &&
+      Math.abs(line.x - previous.x) <= SAME_EDGE_PT;
+    if (continues && open) open.push(line);
+    else blocks.push([line]);
+  }
+  return blocks;
+}
+
+/**
+ * Whether a block is one piece of text the layout wrapped, rather than lines placed one under another.
+ *
+ * The test is the geometry that defines wrapping: every line but the last ends flush at the same right
+ * margin, because reaching that margin is what broke the line. A list item too long for its column
+ * and a paragraph both pass. A run of separately positioned lines - a heading, then a skills line,
+ * then a date - has a ragged right edge and fails, which is what stops a whole section being glued
+ * into one line, and a line that ended a sentence did not run out of room either.
+ *
+ * The last line must also fall SHORT of that margin, because text that reached it would have wrapped
+ * again. Two lines of one block are otherwise indistinguishable from two lines placed under each
+ * other - a name above a job title - since a single line is trivially flush with itself.
+ *
+ * Being wrong in the cautious direction leaves a wrapped item split across two lines, which is what
+ * the document looks like anyway. Being wrong the other way invents a line the resume does not have.
+ */
+function isWrappedBlock(block: readonly TextLine[]): boolean {
+  if (block.length < 2) return false;
+  const broken = block.slice(0, -1);
+  const margin = Math.max(...broken.map((line) => line.right));
+  const flush = broken.every(
+    (line) => Math.abs(line.right - margin) <= SAME_EDGE_PT && !ENDS_SENTENCE.test(line.text.trim()),
+  );
+  return flush && margin - (block[block.length - 1] as TextLine).right > SAME_EDGE_PT;
+}
+
+/** A column's lines, with the ones the layout wrapped put back together. */
+function columnLines(runs: readonly TextRun[]): TextLine[] {
+  return blocksOf(linesOf(runs)).flatMap((block) => {
+    if (!isWrappedBlock(block)) return block;
+    const first = block[0] as TextLine;
+    const last = block[block.length - 1] as TextLine;
+    return [
+      {
+        ...first,
+        text: block.map((line) => line.text).reduce((left, right) => joinWrappedLines(left, right)),
+        right: Math.max(...block.map((line) => line.right)),
+        height: Math.max(...block.map((line) => line.height)),
+        lastOrder: last.lastOrder,
+        lastEol: last.lastEol,
+      },
+    ];
+  });
+}
+
+/**
+ * The lines this page sets larger than its body text, which is how a resume marks a section.
+ *
+ * Point size is the heading signal a PDF reliably carries, and the only one available here: "SKILLS"
+ * and "Corporate sales account management" are both short and unpunctuated, so no reading of the TEXT
+ * can separate them, and guessing wrongly is what files a skill under the languages section. Measured
+ * against this page's median line so it is a fact about this document rather than a point size, and
+ * when a document sets its headings at body size this finds none and the text-shaped fallback stands.
+ */
+function headingsOf(lines: readonly TextLine[]): string[] {
+  const heights = lines.map((line) => line.height).sort((a, b) => a - b);
+  const median = heights[Math.floor(heights.length / 2)] ?? 0;
+  if (median <= 0) return [];
+  return lines
+    .map((line) => ({ height: line.height, text: line.text.trim() }))
+    .filter((line) => line.height >= median * HEADING_SIZE_RATIO && looksLikeHeading(line.text))
+    .map((line) => line.text);
+}
+
+/** One page, in the order a person would read it, and the headings it marks out. */
+function pageText(items: readonly unknown[]): { text: string; headings: string[] } {
+  const runs = textRuns(items);
+  const gutter = findGutter(runs);
+  const columns =
+    gutter === null
+      ? [runs]
+      : [runs.filter((run) => run.x + run.width <= gutter), runs.filter((run) => run.x >= gutter)];
+  // Column by column, but sized against the whole page: body text is a property of the document.
+  const lines = columns.flatMap((column) => columnLines(column));
+  return { text: lines.map((line) => line.text).join("\n"), headings: headingsOf(lines) };
+}
 
 async function readPdf(bytes: Uint8Array): Promise<ExtractionOutcome> {
   try {
@@ -112,11 +379,18 @@ async function readPdf(bytes: Uint8Array): Promise<ExtractionOutcome> {
       return { failure: "too_large", message: EXTRACTION_FAILURES.too_large };
     }
 
-    // mergePages: false is the point - a page per entry is what lets the application decide, later
-    // and for itself, which page a quote came from.
-    const result = await extractText(pdf, { mergePages: false });
-    const pages = Array.isArray(result.text) ? result.text : [String(result.text)];
-    return { document: normalizeDocument(pages) };
+    // A page at a time, so each page's columns are resolved against that page's own layout and a
+    // quote can still be placed on the page it came from.
+    const pages: string[] = [];
+    const headings: string[] = [];
+    for (let number = 1; number <= pdf.numPages; number += 1) {
+      const page = await pdf.getPage(number);
+      const { items } = await page.getTextContent();
+      const read = pageText(items);
+      pages.push(read.text);
+      headings.push(...read.headings);
+    }
+    return { document: normalizeDocument(pages, headings) };
   } catch {
     // Whatever pdf.js said about the file stays here. A recruiter gets one sentence.
     return { failure: "extract_failed", message: EXTRACTION_FAILURES.extract_failed };

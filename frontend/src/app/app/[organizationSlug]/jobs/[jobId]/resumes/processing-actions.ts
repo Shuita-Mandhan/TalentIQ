@@ -42,8 +42,14 @@ function text(formData: FormData, field: string): string {
  * Deterministic, so two runs of the same code produce the same key and a change to either the
  * extractor or the profile shape produces a different one. That is how a result written months ago is
  * later recognised as stale rather than silently trusted.
+ *
+ * NOT exported. This is a "use server" module, and Next.js requires every export of one to be an
+ * async function because each export becomes a callable server endpoint. Exporting this string made
+ * the whole module fail to load at runtime with `A "use server" file can only export async
+ * functions, found string` - which took the processResume action down with it. It is used only here,
+ * so it is module-local. If another module ever needs it, it belongs in a plain module, not this one.
  */
-export const PROCESSING_VERSION = `${PARSER_VERSION}|${PROFILE_SCHEMA_VERSION}`;
+const PROCESSING_VERSION = `${PARSER_VERSION}|${PROFILE_SCHEMA_VERSION}`;
 
 /**
  * Reads one resume into a candidate profile.
@@ -167,7 +173,12 @@ export async function processResume(
 
   // The trust boundary. Everything the model produced is checked against the document before any of
   // it is stored, and anything it could not ground there is dropped.
-  const parsed = parseCandidateProfile(raw, document.text, document.pages);
+  const parsed = parseCandidateProfile(
+    raw,
+    document.text,
+    document.pages,
+    document.headings,
+  );
   if ("error" in parsed) {
     return settle("ai_malformed", document.text, document.pageCount, provider.name, provider.model);
   }

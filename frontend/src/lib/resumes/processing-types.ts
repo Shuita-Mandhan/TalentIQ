@@ -107,6 +107,8 @@ export type ResumeProcessing = {
   application_id: string | null;
   created_at: string;
   completed_at: string | null;
+  /** Still in flight long after it could be: its process disappeared. Decided by the read. */
+  stalled: boolean;
 };
 
 export type CandidateRecord = {
@@ -139,9 +141,42 @@ export const IDENTITY_LABELS: Record<CandidateRecord["identity_state"], string> 
  */
 export const PROCESSING_CONCURRENCY = 2;
 
-/** Whether an attempt in this state may be started again. A success may not. */
-export function canRetry(status: ProcessingStatus | null): boolean {
-  return status === "failed" || status === "needs_review";
+/**
+ * Whether an attempt that still says it is in flight can no longer be.
+ *
+ * The same reasoning the job-description analysis read uses: a request cannot outlive its own
+ * timeout, so an attempt older than that plus slack had its process disappear - a server restart
+ * during the several minutes a local model takes is the ordinary way this happens.
+ *
+ * The cutoff is passed in rather than computed here, for two reasons. This module is imported by a
+ * client component, and reading the provider timeout would pull the AI modules into a browser
+ * bundle. And the caller computes the cutoff with exactly the expression the processing action hands
+ * to start_resume_processing, so what the interface calls stale and what the database is willing to
+ * supersede cannot drift apart.
+ */
+export function isStalledAttempt(
+  attempt: { status: ProcessingStatus; created_at: string },
+  staleBeforeMs: number,
+): boolean {
+  if (attempt.status !== "waiting" && attempt.status !== "processing") return false;
+  const started = new Date(attempt.created_at).getTime();
+  // An unparseable timestamp is not evidence of anything, so it is not called stale.
+  if (Number.isNaN(started)) return false;
+  return started < staleBeforeMs;
+}
+
+/**
+ * Whether this attempt may be started again.
+ *
+ * A success may not: nothing overwrites a profile that was read correctly, and the database refuses
+ * it too (TQ012). A failure or a review may. So may an attempt that is stalled - without that, a
+ * resume whose processing died mid-run showed "Processing" forever with no control to recover it,
+ * even though the database would have allowed a fresh attempt.
+ */
+export function canRetry(attempt: ResumeProcessing | null | undefined): boolean {
+  if (attempt === null || attempt === undefined) return false;
+  if (attempt.stalled) return true;
+  return attempt.status === "failed" || attempt.status === "needs_review";
 }
 
 /** Whether a resume has never been through processing. */

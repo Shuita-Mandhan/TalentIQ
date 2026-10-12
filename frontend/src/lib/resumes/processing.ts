@@ -1,10 +1,26 @@
+import { resolveTimeoutMs, staleAfterMs } from "@/lib/ai/extraction";
 import { createClient } from "@/lib/supabase/server";
 import type { EvidenceRecord } from "./profile";
-import type { CandidateRecord, ResumeProcessing } from "./processing-types";
+import { isStalledAttempt, type CandidateRecord, type ResumeProcessing } from "./processing-types";
 
 // Reads for resume processing. Every one runs as the signed-in user under RLS, which returns nothing
 // without jobs.view and nothing belonging to another organization — so the organization filter here
 // is a narrowing, not the boundary. The boundary is the policy.
+
+/**
+ * The moment before which an in-flight attempt can no longer be alive.
+ *
+ * Exactly the expression the processing action passes to start_resume_processing as `stale_before`,
+ * so an attempt the interface offers to retry is one the database is willing to supersede.
+ */
+function staleBefore(): number {
+  return Date.now() - staleAfterMs(resolveTimeoutMs(process.env.AI_TIMEOUT_MS));
+}
+
+/** Decided by the read, not stored: the row is settled the next time an attempt starts. */
+function withStalled(row: Omit<ResumeProcessing, "stalled">, cutoff: number): ResumeProcessing {
+  return { ...row, stalled: isStalledAttempt(row, cutoff) };
+}
 
 const PROCESSING_COLUMNS =
   "id, organization_id, job_id, resume_id, attempt, is_current, status, parser, parser_version, processing_version, provider, model, page_count, structured_profile, error_code, error, application_id, created_at, completed_at";
@@ -33,7 +49,13 @@ export async function getCurrentProcessings(
     .eq("job_id", jobId)
     .eq("is_current", true);
   if (error) throw new Error("Unable to load resume processing status");
-  return new Map((data as ResumeProcessing[]).map((row) => [row.resume_id, row]));
+  const cutoff = staleBefore();
+  return new Map(
+    (data as Omit<ResumeProcessing, "stalled">[]).map((row) => [
+      row.resume_id,
+      withStalled(row, cutoff),
+    ]),
+  );
 }
 
 /** The current attempt for one resume, or null when it has never been processed. */
@@ -52,7 +74,8 @@ export async function getCurrentProcessing(
     .eq("is_current", true)
     .maybeSingle();
   if (error) throw new Error("Unable to load resume processing status");
-  return data as ResumeProcessing | null;
+  if (!data) return null;
+  return withStalled(data as Omit<ResumeProcessing, "stalled">, staleBefore());
 }
 
 /**
@@ -74,7 +97,8 @@ export async function getProcessingHistory(
     .eq("resume_id", resumeId)
     .order("attempt", { ascending: false });
   if (error) throw new Error("Unable to load the processing history");
-  return data as ResumeProcessing[];
+  const cutoff = staleBefore();
+  return (data as Omit<ResumeProcessing, "stalled">[]).map((row) => withStalled(row, cutoff));
 }
 
 export async function getEvidence(

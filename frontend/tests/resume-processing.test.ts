@@ -14,7 +14,7 @@
 //   npm test
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { test } from "node:test";
 import {
   MAX_PDF_PAGES,
@@ -33,6 +33,12 @@ import {
   parserFor,
 } from "../src/lib/documents/extract.ts";
 import {
+  canRetry,
+  isStalledAttempt,
+  type ProcessingStatus,
+  type ResumeProcessing,
+} from "../src/lib/resumes/processing-types.ts";
+import {
   Document,
   EMPTY_PROFILE,
   GENERATED_FIELDS,
@@ -42,6 +48,7 @@ import {
   normalizeEmail,
   normalizePhone,
   parseCandidateProfile,
+  sectionSubject,
   PROFILE_SYSTEM_PROMPT,
 } from "../src/lib/resumes/profile.ts";
 
@@ -154,8 +161,8 @@ test("phase 8 new test 1: a document is read, normalized, and never added to", a
   const extractorSource = read("../src/lib/documents/extract.ts");
   assert.ok(
     extractorSource.indexOf("pdf.numPages > MAX_PDF_PAGES") <
-      extractorSource.indexOf("extractText(pdf"),
-    "the page count is checked before any text is extracted",
+      extractorSource.indexOf("page.getTextContent()"),
+    "the page count is checked before any page's text is read",
   );
   assert.ok(
     extractorSource.includes("maxOutputLength: MAX_DOCX_XML_BYTES"),
@@ -165,6 +172,124 @@ test("phase 8 new test 1: a document is read, normalized, and never added to", a
   assert.ok(MAX_DOCX_XML_BYTES >= 1024 * 1024, "the XML cap leaves room for a real document");
   assert.ok(MAX_ZIP_ENTRIES > 10, "and the archive walk is bounded but not crippled");
   assert.ok(EXTRACTION_TIMEOUT_MS > 0 && EXTRACTION_TIMEOUT_MS <= 60_000, "extraction cannot hang forever");
+
+  // --- reading order: a heading must stay attached to the text under it --------------------------
+  //
+  // pdf.js reports text in CONTENT-STREAM order, which is the order the producing tool happened to
+  // write it. A real resume built in a design tool arrived with "SKILLS" and "LANGUAGE" adjacent near
+  // the top and the actual skills six lines later under "EDUCATION"; the model then read English and
+  // French - the only list it could see under a heading - as the candidate's skills, and lost all
+  // four real ones. No prompt can recover from that, because the association is no longer in the text.
+  //
+  // two-column.pdf is built with its content stream deliberately scrambled: both sidebar headings
+  // first and adjacent, their contents much later, columns interleaved. If reading order is ever
+  // taken from the stream again, these assertions fail.
+  const columns = await extractDocument(fixture("two-column.pdf"), PDF);
+  assert.ok(isExtracted(columns), "a two-column resume is read");
+  const lines = columns.document.text.split("\n").filter((line) => line.length > 0);
+
+  const at = (needle: string) => lines.indexOf(needle);
+  assert.ok(at("SKILLS") !== -1 && at("LANGUAGE") !== -1, "both sidebar headings survive");
+
+  // The property the model depends on: each heading is followed by its OWN items and nothing else.
+  assert.deepEqual(
+    lines.slice(at("SKILLS") + 1, at("LANGUAGE")),
+    ["Market research", "Partner management", "Retail analytics"],
+    "SKILLS is followed by the skills, and by nothing between it and the next heading",
+  );
+  assert.deepEqual(
+    lines.slice(at("LANGUAGE") + 1, at("LANGUAGE") + 3),
+    ["English", "German"],
+    "and LANGUAGE is followed by the languages",
+  );
+  // The failure this guards against, stated as the thing that must not happen.
+  for (const language of ["English", "German"]) {
+    assert.ok(
+      at(language) > at("LANGUAGE"),
+      `${language} must appear under LANGUAGE, never between SKILLS and LANGUAGE where it would ` +
+        `read as a skill`,
+    );
+  }
+  assert.ok(
+    at("EDUCATION") < at("SKILLS"),
+    "the sidebar keeps its own top-to-bottom order rather than the stream's",
+  );
+  // Columns are read one after the other, not interleaved row by row.
+  assert.ok(
+    at("German") < at("ALEX MORGAN"),
+    "the whole left column precedes the right column",
+  );
+  assert.ok(
+    at("WORK EXPERIENCE") < at("Globex Corporation") &&
+      at("Globex Corporation") < at("Jan 2020 - present"),
+    "and the right column is itself in order",
+  );
+  // And the scrambled stream order is genuinely different from the output, so this fixture really
+  // does exercise the reconstruction rather than passing by luck.
+  assert.notDeepEqual(
+    lines.slice(0, 3),
+    ["SKILLS", "LANGUAGE", "ALEX MORGAN"],
+    "the stream order is not the reading order",
+  );
+
+  // --- wrapped lines, and the lines that only look wrapped ---------------------------------------
+  //
+  // A list item too long for its column arrives as two lines. Read as two lines it becomes two
+  // skills, one of them a word of the other: a real resume listed "Packaged Consumer Goods Sales"
+  // and the profile claimed "Packaged Consumer Goods" and "Sales" separately. What must NOT happen
+  // is the opposite - gluing together lines the document merely placed under one another, which
+  // would invent wording no resume contains.
+  //
+  // wrapped-list.pdf holds one of each case, each written as a single text block so pdf.js reports
+  // them the way a layout engine's wrapping is reported.
+  const wrapped = await extractDocument(fixture("wrapped-list.pdf"), PDF);
+  assert.ok(isExtracted(wrapped), "a resume with wrapped list items is read");
+  const wrappedLines = wrapped.document.text.split("\n").filter((line) => line.length > 0);
+
+  assert.ok(
+    wrappedLines.includes("Enterprise retail partner management"),
+    "a list item broken across two lines is read as the one item it is",
+  );
+  assert.equal(
+    wrappedLines.includes("management"),
+    false,
+    "and the remainder does not also stand alone as an item of its own",
+  );
+
+  // The three that must stay apart, each for its own reason.
+  assert.ok(
+    wrappedLines.includes("Jane Morgan") && wrappedLines.includes("Principal Data Engineer"),
+    "a name and a job title under it are two lines: the first never ran out of room",
+  );
+  assert.ok(
+    wrappedLines.includes("Shipped the billing service.") && wrappedLines.includes("Education"),
+    "a line that finished a sentence did not run out of room either",
+  );
+  assert.ok(
+    wrappedLines.includes("English") && wrappedLines.includes("Portuguese"),
+    "and two languages stay two languages, however short they are",
+  );
+  // Ragged-right text is left as the document drew it. Lines that end at different places cannot be
+  // told from lines positioned separately, and splitting a wrapped phrase costs less than inventing
+  // a sentence. Justified text does end at one margin and is rejoined.
+  assert.ok(
+    wrappedLines.includes("Led the platform team through a migration"),
+    "a ragged-right paragraph is left alone rather than guessed at",
+  );
+
+  // Headings come from how the document is SET, not from how the line reads. "SKILLS" and
+  // "Enterprise retail partner management" are both short and unpunctuated, so no reading of the
+  // text can separate them - and mistaking one for a heading is what filed a skill under the
+  // languages section.
+  assert.deepEqual(
+    wrapped.document.headings,
+    ["JANE MORGAN", "SKILLS", "SUMMARY", "EXPERIENCE", "LANGUAGE"],
+    "the lines set larger than the body text are the headings, and nothing else is",
+  );
+  // A document that sets its headings at body size offers nothing to measure, and says so rather
+  // than guessing - which keeps every existing single-column document reading exactly as it did.
+  assert.deepEqual(pdf.document.headings, [], "a flatly styled PDF reports no headings");
+  assert.deepEqual(docx.document.headings, [], "and a DOCX has no styling here to read");
 
   // --- normalization: deterministic, and only ever subtractive -----------------------------------
   const messy = normalizeDocument([
@@ -624,6 +749,132 @@ test("phase 8 new test 2: a model's answer is believed only where the document s
     "while the rest of the role, which the document does support, survives",
   );
 
+  // --- a quote has to come from a section that speaks for the fact -------------------------------
+  //
+  // This is the defence the original failure got past. A two-column resume had been read in the
+  // wrong order, the model reported English and French as the candidate's SKILLS, and the evidence
+  // marked both verified - because "English" really does occur in the document. It occurs under
+  // LANGUAGE, which is not evidence of a skill, and proving a string exists somewhere was never the
+  // same as proving it supports the claim.
+  //
+  // So the section a quote sits in is read forwards from the document's own headings, and a quote
+  // taken from a section about a different kind of fact does not count. The claim is not accepted
+  // on weaker terms either: it stays indirect with no quote, which is what a recruiter needs to see.
+  const SECTIONED = [
+    "DONNA EXAMPLE",
+    "EDUCATION",
+    "BA Sales and Commerce",
+    "Wardiere University",
+    "SKILLS",
+    "Fast-moving Consumer Goods",
+    "Experience in retail",
+    "LANGUAGE",
+    "English",
+    "French",
+  ].join("\n");
+  const SECTION_HEADINGS = ["DONNA EXAMPLE", "EDUCATION", "SKILLS", "LANGUAGE"];
+
+  const sectioned = parseCandidateProfile(
+    {
+      candidate: { full_name: "Donna Example" },
+      // Two real skills, and two the document only appears to support: "English" is a language, and
+      // "Sales" occurs solely inside the name of a degree.
+      skills: [
+        { skill: "Fast-moving Consumer Goods" },
+        { skill: "Experience in retail" },
+        { skill: "English" },
+        { skill: "Sales" },
+      ],
+      experience: [],
+      education: [{ institution: "Wardiere University", degree: "BA Sales and Commerce" }],
+      languages: [{ name: "English" }, { name: "French" }],
+      evidence: [
+        { fact_type: "skill", fact_key: "English", evidence_status: "verified", confidence: 1 },
+        { fact_type: "skill", fact_key: "Sales", evidence_status: "verified", confidence: 1 },
+      ],
+    },
+    SECTIONED,
+    [SECTIONED],
+    SECTION_HEADINGS,
+  );
+  assert.ok(!("error" in sectioned));
+  if ("error" in sectioned) return;
+
+  const factFor = (type: string, key: string) =>
+    sectioned.evidence.find((item) => item.fact_type === type && item.fact_key === key);
+
+  // The section is the heading above the line, not the line above it. Every item of a list gets the
+  // list's heading, where before each got the item printed above it.
+  for (const skill of ["Fast-moving Consumer Goods", "Experience in retail"]) {
+    const record = factFor("skill", skill);
+    assert.equal(record?.source_section, "SKILLS", `${skill} is evidenced from the skills section`);
+    assert.equal(record?.quote_verified, true, `${skill} is quoted from the document`);
+    assert.equal(record?.evidence_status, "verified");
+  }
+  for (const language of ["English", "French"]) {
+    const record = factFor("language", language);
+    assert.equal(record?.source_section, "LANGUAGE", `${language} is evidenced from LANGUAGE`);
+    assert.equal(record?.quote_verified, true);
+  }
+  assert.equal(
+    factFor("education", "Wardiere University")?.source_section,
+    "EDUCATION",
+    "and a degree is evidenced from the education section",
+  );
+
+  // The two claims the document does not support, each refused for the right reason.
+  const asSkill = factFor("skill", "English");
+  assert.equal(asSkill?.quote_verified, false, "English is not evidence of a skill");
+  assert.equal(asSkill?.evidence_status, "indirect", "the wording is there, the support is not");
+  assert.equal(asSkill?.source_quote, null, "so there is no quote to show");
+  assert.equal(asSkill?.source_section, null, "and no section is claimed for it");
+
+  const fromDegree = factFor("skill", "Sales");
+  assert.equal(
+    fromDegree?.quote_verified,
+    false,
+    "the Sales inside BA Sales and Commerce is a degree, not a skill",
+  );
+  assert.equal(fromDegree?.evidence_status, "indirect");
+  assert.equal(fromDegree?.source_quote, null);
+
+  // The model marked both of those verified itself. It cannot.
+  assert.equal(
+    sectioned.evidence.every(
+      (item) => item.evidence_status !== "verified" || item.quote_verified === true,
+    ),
+    true,
+    "nothing is verified without a quote this code found for itself",
+  );
+
+  // A section whose name says nothing about the matter rules nothing out, or a resume that keeps its
+  // skills under a heading this does not recognise would lose all of them.
+  const unlabelled = parseCandidateProfile(
+    {
+      candidate: { full_name: "Donna Example" },
+      skills: [{ skill: "Fast-moving Consumer Goods" }],
+      experience: [],
+      education: [],
+    },
+    SECTIONED,
+    [SECTIONED],
+    ["DONNA EXAMPLE", "WHAT I BRING"],
+  );
+  assert.ok(!("error" in unlabelled));
+  if ("error" in unlabelled) return;
+  assert.equal(
+    factFor("skill", "Fast-moving Consumer Goods") !== undefined &&
+      unlabelled.evidence.find((item) => item.fact_key === "Fast-moving Consumer Goods")
+        ?.quote_verified,
+    true,
+    "a heading with no subject withholds nothing",
+  );
+  assert.equal(sectionSubject("Skills & Languages"), null, "and a heading about both settles neither");
+  assert.equal(sectionSubject("Technical Skills"), "skill");
+  assert.equal(sectionSubject("WORK EXPERIENCE"), "experience");
+  assert.equal(sectionSubject("Awards and Honours"), "achievement");
+  assert.equal(sectionSubject(null), null);
+
   // --- the pieces the above rests on ------------------------------------------------------------
   const document = new Document(RESUME_TEXT, RESUME_PAGES);
   assert.ok(document.contains("Python, FastAPI, PostgreSQL"));
@@ -657,4 +908,262 @@ test("phase 8 new test 2: a model's answer is believed only where the document s
   assert.ok(PROFILE_SYSTEM_PROMPT.includes("Do not rate, score, rank or recommend"));
   assert.ok(/null/.test(PROFILE_SYSTEM_PROMPT) && PROFILE_SYSTEM_PROMPT.includes("does NOT mean"),
     "and that a missing value is not a claim about the candidate");
+
+  // --- the request asks only for what the application cannot work out for itself ----------------
+  //
+  // Generation is the whole cost of this request: measured on the local provider, prompt evaluation
+  // of ~1100 tokens finishes in well under a second once warm while generation runs at about 4.8
+  // tokens a second regardless of how Ollama is configured. So every field the model is asked for is
+  // paid for in a recruiter's waiting time, and asking for one the application derives anyway is how
+  // a two-page resume came to exceed the 300s ceiling. These assertions keep it from creeping back.
+  for (const notRequested of [
+    '"evidence"',      // built here, from the document, for every fact that survives grounding
+    '"description"',   // model prose; the role's own line is already its evidence quote
+    '"summary"',       // model prose
+    '"detail"',        // likewise, on the four simple lists
+  ]) {
+    assert.ok(
+      !PROFILE_SYSTEM_PROMPT.includes(notRequested),
+      `the prompt must not request ${notRequested}: it costs generated tokens for something the ` +
+        `application either derives itself or does not need from a model`,
+    );
+  }
+  // The simple lists are strings, not one-key objects - fewer tokens, and a bare name is a span of
+  // one line, which is what lets the application quote it.
+  for (const list of ["skills", "certifications", "projects", "languages", "achievements"]) {
+    assert.ok(
+      PROFILE_SYSTEM_PROMPT.includes(`"${list}": [string]`),
+      `${list} must be requested as a list of plain strings`,
+    );
+  }
+  assert.ok(
+    PROFILE_SYSTEM_PROMPT.length < 3000,
+    `the system prompt is ${PROFILE_SYSTEM_PROMPT.length} chars; it is re-evaluated on every ` +
+      `resume, so it is kept small deliberately`,
+  );
+
+  // And the other half of that trade: nothing was DELETED. A provider fast enough to volunteer
+  // prose or its own evidence still has it accepted and rendered, which is why these fields remain
+  // in the schema, the parser and PROFILE_FIELD_PROVENANCE.
+  const generous = parseCandidateProfile(
+    {
+      candidate: { full_name: "Ada Lovelace", summary: "A condensation the model wrote." },
+      skills: [{ skill: "Python" }],
+      experience: [
+        { employer: "Analytical Engines Ltd", title: null, start_date: null, end_date: null,
+          is_current: false, description: "Prose about the role.", skills: ["Python"] },
+      ],
+      education: [],
+      certifications: [{ name: "Python", detail: "a detail the model wrote" }],
+      evidence: [
+        { fact_type: "skill", fact_key: "Python", evidence_status: "verified", confidence: 0.9 },
+      ],
+    },
+    RESUME_TEXT,
+    RESUME_PAGES,
+  );
+  assert.ok(!("error" in generous));
+  if ("error" in generous) return;
+  assert.equal(generous.profile.candidate.summary, "A condensation the model wrote.",
+    "a volunteered summary is still accepted");
+  assert.equal(generous.profile.experience[0]?.description, "Prose about the role.",
+    "so is a volunteered role description");
+  assert.equal(generous.profile.certifications[0]?.detail, "a detail the model wrote",
+    "so is a volunteered detail");
+  assert.deepEqual(generous.profile.experience[0]?.skills, ["Python"],
+    "so are per-role skills");
+  assert.equal(
+    generous.evidence.find((item) => item.fact_key === "Python")?.confidence,
+    0.9,
+    "and a volunteered confidence is still kept as the model's own opinion",
+  );
+  assert.deepEqual(
+    generous.profile.skills.map((entry) => entry.original),
+    ["Python"],
+    "and a skill given as an object is still accepted alongside the bare-string form",
+  );
+});
+
+// ---------------------------------------------------------------------------------------------
+// Phase 8.1 acceptance fixes. Two regressions, both of which reached a real user.
+//
+// The first was invisible to every gate this project has: lint, tsc, strict tsc and the production
+// build all passed while `processResume` could not be called at all, because Next.js only validates
+// the "use server" export contract when it loads the module as an actions module at runtime. A
+// source-level assertion is the cheapest thing that would have caught it, so that is what this is.
+//
+// The second is the stalled attempt. It is tested through the pure predicate the read layer uses,
+// plus the wiring that connects it to the retry control.
+// ---------------------------------------------------------------------------------------------
+
+/** Every module in the app that declares itself a Server Action module. */
+function serverActionModules(): { path: string; source: string }[] {
+  const found: { path: string; source: string }[] = [];
+  const walk = (directory: URL) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directory);
+      if (entry.isDirectory()) walk(child);
+      else if (entry.name.endsWith(".ts")) {
+        const source = readFileSync(child, "utf8");
+        if (/^\s*"use server";/.test(source)) {
+          found.push({ path: decodeURIComponent(child.pathname).split("/src/")[1] ?? entry.name, source });
+        }
+      }
+    }
+  };
+  walk(new URL("../src/app/", import.meta.url));
+  return found;
+}
+
+test("phase 8.1 regression: server actions export only actions, and a stalled attempt can be retried", () => {
+  // --- the "use server" export contract --------------------------------------------------------
+  const modules = serverActionModules();
+  assert.ok(modules.length >= 10, `found ${modules.length} server action modules to check`);
+
+  for (const { path, source } of modules) {
+    // Strip comments first: a sentence about `export const` in a doc block is not an export.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+
+    // Every runtime export of a "use server" module becomes a callable endpoint, so Next.js requires
+    // each one to be an async function. `export type` is erased and therefore fine.
+    const runtimeExports = [...code.matchAll(/^export\s+(?!type\b)(\w+)/gm)].map((m) => m[1]);
+    for (const kind of runtimeExports) {
+      assert.equal(
+        kind,
+        "async",
+        `${path} exports a runtime value declared with "${kind}". A "use server" module may only ` +
+          `export async functions; this is the defect that made processResume unloadable with ` +
+          `'A "use server" file can only export async functions, found string'.`,
+      );
+    }
+    assert.ok(
+      /^export async function /m.test(code),
+      `${path} declares "use server" but exports no async function`,
+    );
+  }
+
+  // The specific value that caused it. It is still used, just not exported.
+  const processingActions = read(
+    "../src/app/app/[organizationSlug]/jobs/[jobId]/resumes/processing-actions.ts",
+  );
+  assert.ok(
+    !/^export const PROCESSING_VERSION/m.test(processingActions),
+    "PROCESSING_VERSION must not be exported from the action module",
+  );
+  assert.ok(
+    /^const PROCESSING_VERSION = `\$\{PARSER_VERSION\}\|\$\{PROFILE_SCHEMA_VERSION\}`;$/m.test(
+      processingActions,
+    ),
+    "and must still be composed from both versions, so a parser or schema change is identifiable",
+  );
+  assert.ok(
+    processingActions.includes("processing_version: PROCESSING_VERSION"),
+    "and must still be recorded on the attempt",
+  );
+
+  // The authorization the fix had to preserve, asserted so a future edit cannot quietly drop it.
+  for (const required of [
+    "requireOrganizationActionAccess(slug)",
+    "requirePermission(context, PERMISSIONS.JOBS_MANAGE)",
+    "UUID_PATTERN.test(jobId)",
+    "getJobResume(organizationId, jobId, resumeId)",
+    'supabase.rpc("start_resume_processing"',
+    'supabase.rpc("complete_resume_processing"',
+    'supabase.rpc("fail_resume_processing"',
+    "accessErrorMessage(started.error",
+    "revalidatePath(",
+  ]) {
+    assert.ok(
+      processingActions.includes(required),
+      `processing-actions.ts must still contain ${required}`,
+    );
+  }
+
+  // --- a stalled attempt ------------------------------------------------------------------------
+  const base = {
+    status: "processing" as ProcessingStatus,
+    created_at: new Date("2026-10-05T12:00:00Z").toISOString(),
+  };
+  const cutoff = new Date("2026-10-05T12:06:00Z").getTime();
+
+  assert.equal(
+    isStalledAttempt(base, cutoff),
+    true,
+    "an attempt that started before the cutoff can no longer be alive",
+  );
+  assert.equal(
+    isStalledAttempt({ ...base, created_at: new Date("2026-10-05T12:05:00Z").toISOString() }, cutoff),
+    true,
+  );
+  assert.equal(
+    isStalledAttempt({ ...base, created_at: new Date("2026-10-05T12:07:00Z").toISOString() }, cutoff),
+    false,
+    "one that started after it is simply still running",
+  );
+  assert.equal(isStalledAttempt({ ...base, status: "waiting" }, cutoff), true, "waiting counts too");
+  // A settled attempt is never stalled, whatever its age: it already has an answer.
+  for (const status of ["succeeded", "needs_review", "failed"] as ProcessingStatus[]) {
+    assert.equal(
+      isStalledAttempt({ ...base, status }, cutoff),
+      false,
+      `a ${status} attempt is settled, not stalled`,
+    );
+  }
+  assert.equal(
+    isStalledAttempt({ ...base, created_at: "not a date" }, cutoff),
+    false,
+    "and an unreadable timestamp is not evidence of anything",
+  );
+
+  // Retry has to follow from it, which is the whole point: before this fix the row showed
+  // "Processing" forever with no control to recover it.
+  const attempt = (over: Partial<ResumeProcessing>): ResumeProcessing =>
+    ({ status: "processing", stalled: false, ...over }) as ResumeProcessing;
+
+  assert.equal(canRetry(attempt({ status: "processing", stalled: true })), true,
+    "a stalled attempt may be retried");
+  assert.equal(canRetry(attempt({ status: "processing", stalled: false })), false,
+    "one genuinely in flight may not");
+  assert.equal(canRetry(attempt({ status: "failed" })), true);
+  assert.equal(canRetry(attempt({ status: "needs_review" })), true);
+  assert.equal(canRetry(attempt({ status: "succeeded" })), false,
+    "and a success is never retried, which the database refuses as well (TQ012)");
+  assert.equal(canRetry(null), false);
+
+  // --- the wiring, so the predicate is actually reached -----------------------------------------
+  const readLayer = read("../src/lib/resumes/processing.ts");
+  assert.ok(
+    readLayer.includes("isStalledAttempt(row, cutoff)"),
+    "the read layer decides stalled, the way the job-analysis read does",
+  );
+  assert.ok(
+    readLayer.includes("staleAfterMs(resolveTimeoutMs(process.env.AI_TIMEOUT_MS))"),
+    "from the same expression the action hands to start_resume_processing, so the two cannot drift",
+  );
+  const actionCutoff = /Date\.now\(\) - staleAfterMs\(resolveTimeoutMs\(process\.env\.AI_TIMEOUT_MS\)\)/;
+  assert.ok(actionCutoff.test(processingActions), "and the action computes stale_before the same way");
+  assert.ok(actionCutoff.test(readLayer), "as does the read");
+
+  const intakePage = read("../src/app/app/[organizationSlug]/jobs/[jobId]/resumes/page.tsx");
+  const profilePage = read(
+    "../src/app/app/[organizationSlug]/jobs/[jobId]/resumes/[resumeId]/page.tsx",
+  );
+  assert.ok(
+    intakePage.includes("canRetry(attempt)") && profilePage.includes("canRetry(attempt)"),
+    "both screens gate Retry on the whole attempt, so a stalled one offers it",
+  );
+  assert.ok(
+    !intakePage.includes("canRetry(attempt.status)") && !profilePage.includes("canRetry(attempt.status)"),
+    "and neither still gates on the status alone, which is what hid the control",
+  );
+  assert.ok(
+    intakePage.includes("attempt === undefined || attempt.stalled"),
+    "a stalled resume counts as not read, so the batch control can pick it up",
+  );
+  assert.ok(
+    read("../src/components/resumes/processing-status.tsx").includes("Stopped unexpectedly"),
+    "and the row says so, rather than showing Processing beside a Retry button",
+  );
 });

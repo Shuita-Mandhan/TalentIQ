@@ -1,0 +1,7 @@
+# core.autocrlf is on, and git decides text vs binary by looking for NUL bytes. A small PDF whose
+# content stream is uncompressed has none, so git calls it text and rewrites every LF as CRLF on
+# checkout - which shifts the byte offsets in the PDF's xref table and leaves an invalid file. The
+# test fixtures are read byte for byte, so say outright that these formats are binary rather than
+# leaving it to a heuristic that two of them only passed by accident.
+*.pdf   binary
+*.docx  binary

@@ -26,16 +26,25 @@ export function ProcessingStatusPill({
   attempt: ResumeProcessing | null | undefined;
 }) {
   const status = attempt?.status ?? null;
-  const tone = TONES[status ?? "none"];
-  // "Not read yet" rather than "none": the resume is here and nothing has gone wrong with it.
-  const label = status === null ? "Not read yet" : PROCESSING_LABELS[status];
+  // A stalled attempt is shown as stopped rather than as still running. Saying "Processing" beside a
+  // Retry button would contradict itself, and a recruiter watching a row that will never finish
+  // deserves to be told so.
+  const stalled = attempt?.stalled === true;
+  const tone = stalled ? TONES.failed : TONES[status ?? "none"];
+  const label =
+    status === null
+      ? // "Not read yet" rather than "none": the resume is here and nothing has gone wrong with it.
+        "Not read yet"
+      : stalled
+        ? "Stopped unexpectedly"
+        : PROCESSING_LABELS[status];
 
   return (
     <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${tone.text}`}>
       <span
         aria-hidden
         className={`size-1.5 shrink-0 rounded-full ${tone.dot} ${
-          status === "processing" ? "animate-pulse motion-reduce:animate-none" : ""
+          status === "processing" && !stalled ? "animate-pulse motion-reduce:animate-none" : ""
         }`}
       />
       {label}

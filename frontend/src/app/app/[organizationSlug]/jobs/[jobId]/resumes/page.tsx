@@ -48,7 +48,15 @@ export default async function ResumeIntakePage({
   // The same rule the rubric uses: holding the key is not enough if the job has been frozen.
   const editable = canManage && job.status !== "archived";
 
-  const unread = resumes.filter((resume) => !processings.has(resume.id)).map((resume) => resume.id);
+  // Not read: never attempted, or attempted by a process that disappeared. A failed or needs-review
+  // attempt is deliberately NOT included - those produced something a person should look at, and a
+  // batch button should not quietly re-run them.
+  const unread = resumes
+    .filter((resume) => {
+      const attempt = processings.get(resume.id);
+      return attempt === undefined || attempt.stalled;
+    })
+    .map((resume) => resume.id);
 
   return (
     <>
@@ -181,7 +189,7 @@ export default async function ResumeIntakePage({
                         Download
                         <span className="sr-only"> {resume.original_filename}</span>
                       </a>
-                      {editable && (attempt === null || canRetry(attempt.status)) && (
+                      {editable && (attempt === null || canRetry(attempt)) && (
                         <ProcessButton
                           organizationSlug={organizationSlug}
                           jobId={job.id}

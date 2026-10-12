@@ -40,6 +40,13 @@ export type DocumentText = {
   contentLength: number;
   /** Repeated page headers or footers this removed, for the record. */
   removedRunningLines: string[];
+  /**
+   * The lines the extractor recognised as section headings from the document's own styling.
+   *
+   * Empty when the extractor had no styling to read - a DOCX, or a PDF that sets its headings at
+   * body size - and a consumer then has only the shape of the line to go on.
+   */
+  headings: string[];
 };
 
 /** Characters that are extraction noise rather than content. */
@@ -67,6 +74,41 @@ function stripInvisibles(text: string): string {
  */
 function rejoinHyphenation(text: string): string {
   return text.replace(/([a-z])-\n([a-z])/g, "$1$2");
+}
+
+/**
+ * A heading-ish line.
+ *
+ * Deliberately conservative: short, no sentence punctuation, not a bullet. "Technical Skills" and
+ * "Experience" pass; "Designed payment services in Python backed by PostgreSQL." does not. It is a
+ * reading of the document rather than a claim about the candidate, so being wrong about one costs a
+ * mislabelled section and nothing else.
+ *
+ * Shape alone cannot settle the question - "Corporate sales account management" is just as short and
+ * unpunctuated as "SKILLS" - so an extractor that can see how the document is styled says which
+ * lines are headings and this is the fallback for documents where it cannot.
+ */
+export function looksLikeHeading(line: string): boolean {
+  if (line.length === 0 || line.length > 40) return false;
+  if (/[.,;:]/.test(line)) return false;
+  if (/^[-*•]/.test(line)) return false;
+  return /[A-Za-z]/.test(line);
+}
+
+/**
+ * Joins a line to the line it wrapped onto.
+ *
+ * The break itself never becomes anything: the layout put it there, the document did not. A space
+ * goes in because one word ended and another began, except after a hyphen - the same ambiguity
+ * rejoinHyphenation resolves, resolved the same way, so "docu-" and "mented" give "documented"
+ * while "Full-" and "Stack" keeps its hyphen.
+ */
+export function joinWrappedLines(first: string, second: string): string {
+  const left = first.replace(/[ \t]+$/, "");
+  const right = second.replace(/^[ \t]+/, "");
+  if (/[a-z]-$/.test(left) && /^[a-z]/.test(right)) return `${left.slice(0, -1)}${right}`;
+  if (left.endsWith("-")) return `${left}${right}`;
+  return `${left} ${right}`;
 }
 
 function normalizePage(raw: string): string {
@@ -132,7 +174,10 @@ function stripRunningLines(pages: string[]): { pages: string[]; removed: string[
   return { pages: working, removed };
 }
 
-export function normalizeDocument(rawPages: readonly string[]): DocumentText {
+export function normalizeDocument(
+  rawPages: readonly string[],
+  rawHeadings: readonly string[] = [],
+): DocumentText {
   const normalized = rawPages.map(normalizePage);
   const { pages, removed } = stripRunningLines(normalized);
   const text = pages.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
@@ -142,6 +187,8 @@ export function normalizeDocument(rawPages: readonly string[]): DocumentText {
     pageCount: pages.length,
     contentLength: text.replace(/\s+/g, "").length,
     removedRunningLines: removed,
+    // Through the same normalization as the lines, or a heading would never match the line it is.
+    headings: [...new Set(rawHeadings.map(normalizePage).filter((line) => line.length > 0))],
   };
 }
 

@@ -156,7 +156,7 @@ export default async function CandidateProfilePage({
             </div>
           )}
         </dl>
-        {editable && attempt !== null && canRetry(attempt.status) && (
+        {editable && attempt !== null && canRetry(attempt) && (
           <ProcessButton
             organizationSlug={organizationSlug}
             jobId={job.id}

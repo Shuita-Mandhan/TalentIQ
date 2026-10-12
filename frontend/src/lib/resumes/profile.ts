@@ -16,6 +16,12 @@
 //      the document rather than accepting one from the model. `quote_verified` is written from that
 //      search, so a model cannot certify its own evidence.
 //
+//      The search is section-aware, because existing somewhere is not support: a quote counts only
+//      when the section it sits in is about that kind of fact. "English" occurs in every resume that
+//      lists it as a language, and that is not evidence of a skill - which is exactly how a skills
+//      list of English and French once passed verification. A fact whose wording is in the document
+//      but not in a section that speaks for it stays `indirect` with no quote, never `verified`.
+//
 //      What that does and does not cover is set out in PROFILE_FIELD_PROVENANCE below. Every entity
 //      gets a located quote; an entity's sub-fields are grounded but share its quote; and three
 //      fields - the summary, a role's description and a named item's detail - are the model's own
@@ -29,6 +35,7 @@
 // Absence is never a claim. A null field means the resume did not say, not that the candidate lacks
 // it, and every comment and label in this phase keeps that distinction.
 
+import { looksLikeHeading } from "../documents/text.ts";
 import { EMAIL_PATTERN } from "../validation.ts";
 
 /** Bumped when the shape below changes, so results written by an older schema are identifiable. */
@@ -284,18 +291,28 @@ export type Location = {
 };
 
 /**
- * A heading-ish line.
+ * What kind of fact a section heading is about, or null when its name settles nothing.
  *
- * Deliberately conservative: short, no sentence punctuation, not a bullet. "Technical Skills" and
- * "Experience" pass; "Designed payment services in Python backed by PostgreSQL." does not. It is a
- * reading of the document rather than a claim about the candidate, so being wrong about one costs a
- * mislabelled section and nothing else.
+ * Generic resume vocabulary rather than the headings of any particular resume: a heading this does
+ * not recognise constrains nothing, which is the safe direction. A heading matching two kinds -
+ * "Skills & Languages" - also settles nothing, because it rules neither of them out.
  */
-function looksLikeHeading(line: string): boolean {
-  if (line.length === 0 || line.length > 40) return false;
-  if (/[.,;:]/.test(line)) return false;
-  if (/^[-*•]/.test(line)) return false;
-  return /[A-Za-z]/.test(line);
+const SECTION_SUBJECTS: readonly { readonly factType: FactType; readonly pattern: RegExp }[] = [
+  { factType: "skill", pattern: /\b(skills?|competenc\w*|proficienc\w*|expertise)\b/ },
+  { factType: "language", pattern: /\blanguages?\b/ },
+  { factType: "education", pattern: /\b(education|academics?|qualificat\w*|degrees?|schooling)\b/ },
+  { factType: "experience", pattern: /\b(experience|employment|work history|career|positions?)\b/ },
+  { factType: "certification", pattern: /\b(certificat\w*|licen[cs]\w*|accreditat\w*)\b/ },
+  { factType: "project", pattern: /\bprojects?\b/ },
+  { factType: "achievement", pattern: /\b(achievements?|awards?|honou?rs?|accomplishments?)\b/ },
+];
+
+/** The fact type a section is about, for deciding whether a quote from it supports a claim. */
+export function sectionSubject(heading: string | null | undefined): FactType | null {
+  if (typeof heading !== "string") return null;
+  const text = comparable(heading);
+  const matched = SECTION_SUBJECTS.filter((subject) => subject.pattern.test(text));
+  return matched.length === 1 ? (matched[0] as { factType: FactType }).factType : null;
 }
 
 /**
@@ -313,15 +330,36 @@ export class Document {
   private readonly haystack: string;
   private readonly pageLines: string[][];
   private readonly pageHaystacks: string[];
+  /** The section each line of each page sits under, by the same indices as pageLines. */
+  private readonly pageSections: (string | null)[][];
   private readonly paged: boolean;
 
-  constructor(text: string, pages: readonly string[] = []) {
+  constructor(text: string, pages: readonly string[] = [], headings: readonly string[] = []) {
     this.text = text;
     this.haystack = comparable(text);
     this.paged = pages.length > 0;
     const source = this.paged ? [...pages] : [text];
     this.pageLines = source.map((page) => page.split("\n"));
     this.pageHaystacks = source.map(comparable);
+
+    // A section is carried forward while reading, because that is how a document is read and how a
+    // section works: every line after a heading belongs to it until the next one. Walking BACKWARDS
+    // from a fact to the nearest short line above it - what this used to do - makes the line above a
+    // skill into that skill's section, so "Packaged Consumer Goods" ended up filed under
+    // "Fast-moving Consumer Goods" and "French" under "English".
+    //
+    // Which lines are headings comes from the extractor when it could see how the document is styled,
+    // and otherwise from the shape of the line, which is all a DOCX or a flatly styled PDF offers.
+    const marked = new Set(headings.map(comparable));
+    this.pageSections = this.pageLines.map((lines) => {
+      let current: string | null = null;
+      return lines.map((raw) => {
+        const line = raw.trim();
+        if (line.length === 0) return current;
+        if (marked.size > 0 ? marked.has(comparable(line)) : looksLikeHeading(line)) current = line;
+        return current;
+      });
+    });
   }
 
   /** Whether this wording occurs in the document. The whole of grounding. */
@@ -349,31 +387,40 @@ export class Document {
    * cannot be anything the document does not say; the page is where that span is; and the section is
    * the nearest heading above it.
    */
-  locate(value: string | null | undefined): Location | null {
+  locate(value: string | null | undefined, about: FactType | null = null): Location | null {
     if (typeof value !== "string") return null;
     const needle = comparable(value);
     if (needle.length < 2) return null;
 
-    for (let pageIndex = 0; pageIndex < this.pageLines.length; pageIndex += 1) {
-      const lines = this.pageLines[pageIndex] as string[];
-      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-        const line = lines[lineIndex] as string;
-        if (line.length === 0 || !comparable(line).includes(needle)) continue;
+    // Two passes, exact lines first. A short name occurs inside longer lines as well as on one of
+    // its own - "BA Sales and Commerce" under EDUCATION precedes the "Sales" that is a skill - and
+    // quoting the first line that merely CONTAINS the wording attributes the fact to the wrong part
+    // of the document. A line that IS the wording is the better quote wherever one exists.
+    for (const exactOnly of [true, false]) {
+      for (let pageIndex = 0; pageIndex < this.pageLines.length; pageIndex += 1) {
+        const lines = this.pageLines[pageIndex] as string[];
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+          const line = lines[lineIndex] as string;
+          if (line.length === 0) continue;
+          const here = comparable(line);
+          if (exactOnly ? here !== needle : !here.includes(needle)) continue;
 
-        let section: string | null = null;
-        for (let back = lineIndex - 1; back >= 0; back -= 1) {
-          const candidate = (lines[back] as string).trim();
-          if (candidate.length === 0) continue;
-          if (looksLikeHeading(candidate)) section = candidate;
-          break;
+          const section = (this.pageSections[pageIndex] as (string | null)[])[lineIndex] ?? null;
+          // Existing somewhere is not support. A quote backs a claim only when the part of the
+          // document it is taken from is about that kind of claim: "English" under LANGUAGE is not
+          // evidence of a skill, and the "Sales" inside "BA Sales and Commerce" under EDUCATION is
+          // not either. A section whose name says nothing about the matter rules nothing out, so a
+          // quote from one still counts - this withholds support, it does not invent a contradiction.
+          const subject = sectionSubject(section);
+          if (about !== null && subject !== null && subject !== about) continue;
+
+          return {
+            quote: line.trim().slice(0, MAX_QUOTE),
+            page: this.paged ? pageIndex + 1 : null,
+            section,
+            context: lines.slice(lineIndex, lineIndex + 3).join("\n"),
+          };
         }
-
-        return {
-          quote: line.trim().slice(0, MAX_QUOTE),
-          page: this.paged ? pageIndex + 1 : null,
-          section,
-          context: lines.slice(lineIndex, lineIndex + 3).join("\n"),
-        };
       }
     }
     // The wording may span a line break, in which case there is no single line to quote. Grounding
@@ -511,11 +558,12 @@ export function parseCandidateProfile(
   raw: unknown,
   documentText: string,
   documentPages: readonly string[] = [],
+  documentHeadings: readonly string[] = [],
 ): ProfileParse {
   const root = asRecord(raw);
   if (!root) return { error: "The model did not return a candidate profile." };
 
-  const document = new Document(documentText, documentPages);
+  const document = new Document(documentText, documentPages, documentHeadings);
   let dropped = 0;
   const drop = () => {
     dropped += 1;
@@ -726,7 +774,9 @@ export function parseCandidateProfile(
 
     const needle = searchFor ?? factKey;
     const claim = claims.get(key);
-    const found = document.locate(needle);
+    // An identity fact is not a sectioned claim - an email is the applicant's email wherever on the
+    // page it is printed - so only the claims a section can speak to are held to one.
+    const found = document.locate(needle, factType === "identity" ? null : factType);
     const status: EvidenceStatus =
       claim?.status === "contradictory"
         ? "contradictory"
@@ -820,8 +870,27 @@ export function evidenceSummary(evidence: readonly EvidenceRecord[]): {
  * A resume is pasted from the outside world and is DATA. It arrives inside a fenced block this
  * prompt names, and the prompt says plainly that nothing inside it is a command. That is defence in
  * depth, not the guarantee: the guarantee is that every fact coming back is grounded in the document
- * and every quote is checked, so text that talks a model into something still cannot produce an
- * employer, a qualification or a skill that is not written in the file.
+ * and every quote is found there by this application, so text that talks a model into something
+ * still cannot produce an employer, a qualification or a skill that is not written in the file.
+ *
+ * It asks for FACTS AND NOTHING ELSE, because generation is the entire cost of this request.
+ * Measured on the local provider: prompt evaluation runs at about 5000 tokens a second and is over
+ * in 0.2s, while generation runs at about 4.8 tokens a second no matter how Ollama is configured.
+ * So the only thing that decides whether a resume finishes inside the timeout is how many tokens the
+ * model is asked to produce, and three kinds of output were being asked for that the application
+ * does not need from a model:
+ *
+ *   - Evidence. Built here, from the document, for every fact that survives grounding.
+ *   - Prose. A per-role description and a candidate summary are the only fields on a profile that
+ *     are the model's own words rather than the document's; they were a quarter of the generated
+ *     tokens. The document's own wording for each role is already shown, as that role's evidence
+ *     quote, and the original file is one click away.
+ *   - Wrappers. A skill is a string, not an object with one key; likewise a certification, project,
+ *     language or achievement. The parser has always accepted both forms.
+ *
+ * parseCandidateProfile still ACCEPTS every one of those, so a provider fast enough to volunteer a
+ * summary, a role description or its own evidence still contributes them and the interface still
+ * renders them. They are simply no longer requested from a provider that cannot afford them.
  */
 export const PROFILE_SYSTEM_PROMPT = `You read resumes and return structured data about the applicant.
 
@@ -833,51 +902,42 @@ about the candidate.
 
 Rules:
 - Report only what the resume actually says. Never infer, estimate, round up or fill in.
-- If the resume does not state something, use null, or an empty list. A missing value means the
+- If the resume does not state something, use null, or omit the list. A missing value means the
   resume did not say so. It does NOT mean the candidate lacks it, and you must not guess either way.
 - Never invent an employer, a job title, a school, a degree, a certification, a skill, a date or a
   contact detail. If it is not written in the resume, it does not exist for your purposes.
 - Do not total up or summarise years of experience. Report each role separately with the dates the
   resume gives.
 - Do not rate, score, rank or recommend the candidate. You are not assessing them.
-- Copy wording exactly when you quote. A quote must be a verbatim span from the resume.
-- Return nothing but JSON.
+- Dates are strings exactly as the resume writes them. Do not reformat them.
+- Copy names as the resume writes them. Do not describe, summarise, paraphrase or explain anything,
+  and do not quote the resume back: the application reads the document itself, so prose of any kind
+  would be discarded and would only make your answer longer.
+- Return nothing but the JSON object. Omit any list that would be empty.
 
 Return a JSON object of exactly this shape:
 {
   "candidate": {"full_name":string|null,"email":string|null,"phone":string|null,"location":string|null,
-                "headline":string|null,"summary":string|null,"linkedin_url":string|null,
-                "website_url":string|null},
-  "skills": [{"skill":string}],
+                "headline":string|null,"linkedin_url":string|null,"website_url":string|null},
+  "skills": [string],
   "experience": [{"employer":string|null,"title":string|null,"start_date":string|null,
-                  "end_date":string|null,"is_current":boolean,"description":string|null,
-                  "skills":[string]}],
+                  "end_date":string|null,"is_current":boolean}],
   "education": [{"institution":string|null,"degree":string|null,"field":string|null,
                  "start_date":string|null,"end_date":string|null,"completion":string|null}],
-  "certifications": [{"name":string,"detail":string|null}],
-  "projects": [{"name":string,"detail":string|null}],
-  "languages": [{"name":string,"detail":string|null}],
-  "achievements": [{"name":string,"detail":string|null}],
-  "evidence": [{"fact_type":"identity|skill|experience|education|certification|project|language|achievement",
-                "fact_key":string,
-                "evidence_status":"verified|likely|indirect|not_found|contradictory|unable_to_determine",
-                "confidence":number}]
+  "certifications": [string],
+  "projects": [string],
+  "languages": [string],
+  "achievements": [string]
 }
 
-Dates are strings exactly as the resume writes them - do not reformat them.
+In the last four lists give the NAME ONLY, with no description, date or parenthetical after it: the
+certification, the project, the language, the achievement. A name is one span of one line in the
+document, which is what lets the application find and quote it; a name with its description appended
+usually is not.
 
-Do NOT quote the resume back. The application finds the supporting wording in the document itself, so
-a quote from you would be ignored and would only make your answer longer. Evidence entries are short:
-what the fact is, and how confident you are in it.
-
-fact_key identifies what the evidence is about, and must be written exactly like this:
-- for fact_type "identity": one of full_name, email, phone, location, linkedin_url, website_url
-- for fact_type "skill": the skill exactly as you reported it in "skills"
-- for fact_type "experience": the employer, exactly as you reported it
-- for fact_type "education": the institution, exactly as you reported it
-- for certification, project, language and achievement: the name, exactly as you reported it
-
-Keep the answer as short as the data allows. Omit empty lists rather than padding them.`;
+Fill "achievements" only from a section the resume itself presents as achievements, awards or
+honours. Do not mine the bullet points of a job for them: those belong to the role, the application
+already quotes the role from the document, and a fragment of a sentence cannot be quoted back.`;
 
 /** The user message: the resume, fenced, and nothing about the organization. */
 export function buildProfileRequest(resumeText: string): string {
@@ -897,7 +957,6 @@ export const PROFILE_JSON_SCHEMA = {
     projects: { type: "array" },
     languages: { type: "array" },
     achievements: { type: "array" },
-    evidence: { type: "array" },
   },
-  required: ["candidate", "skills", "experience", "education", "evidence"],
+  required: ["candidate", "skills", "experience", "education"],
 } as const;
